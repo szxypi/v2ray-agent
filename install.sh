@@ -823,8 +823,8 @@ readInstallProtocolType() {
         fi
         if echo "${row}" | grep -q snell_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}15,"
+            # snell 片段没有 tls 和 users，不能作为 frontingType（host 与账号来源）
             if [[ "${coreInstallType}" == "2" ]]; then
-                frontingType=15_snell_inbounds
                 singBoxSnellPort=$(jq .inbounds[0].listen_port "${row}.json")
                 singBoxSnellPSK=$(jq -r '.inbounds[0].psk' "${row}.json")
             fi
@@ -3435,12 +3435,6 @@ initSingBoxClients() {
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
 
-        # snell
-        if echo "${type}" | grep -q ",15,"; then
-            currentUser="{\"userkey\":\"${uuid}\",\"name\":\"${name}-snell\"}"
-            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
-        fi
-
         if echo "${type}" | grep -q ",20,"; then
             currentUser="{\"username\":\"${uuid}\",\"password\":\"${uuid}\"}"
 
@@ -5584,6 +5578,7 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxSnellPort}")
         echoContent green "\n ---> Snell端口：${result[-1]}"
         # 复用已有密钥，避免重新安装后客户端失效
+        # 单 PSK 模式：不写 users。写了 users 会进入多用户模式，按 userkey 鉴权，Surge 没有 userkey 参数，连接全部被拒
         if [[ -z "${singBoxSnellPSK}" ]]; then
             singBoxSnellPSK=$(initSnellPSK)
         fi
@@ -5597,8 +5592,7 @@ EOF
             "listen_port": ${result[-1]},
             "psk": "${singBoxSnellPSK}",
             "version": 5,
-            "obfs_mode": "none",
-            "users": $(initSingBoxClients 15)
+            "obfs_mode": "none"
         }
     ]
 }
@@ -6170,7 +6164,12 @@ EOF
     elif [[ "${type}" == "snell" ]]; then
         echoContent yellow " ---> Snell"
         echoContent yellow " ---> 格式化明文(Snell)"
-        echoContent green "协议类型:Snell，地址:${currentHost}，端口:${port}，版本:5，obfs:none，PSK:${id}，账户名:${email}\n"
+        # 服务端是 v5。sing-box 不支持 v5 的 QUIC 代理模式，v5 线协议与 v4 相同，客户端声明 v4，避免 Surge 对 QUIC 使用 v5 QUIC 代理模式
+        local snellHost=${currentHost}
+        if [[ -z "${snellHost}" || "${snellHost}" == "null" ]]; then
+            snellHost=$(getPublicIP)
+        fi
+        echoContent green "协议类型:Snell，地址:${snellHost}，端口:${port}，版本:4（服务端 v5 兼容 v4 客户端），obfs:none，PSK:${id}（所有账号共用），账户名:${email}\n"
 
         # snell 无出站协议实现，sing-box 订阅无法下发，只通过 Surge 订阅输出
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
@@ -6178,11 +6177,11 @@ EOF
         fi
         mkdir -p "${outputRoot}/surge" || return 1
         cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true
+${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true
 EOF
 
         echoContent yellow " ---> Surge"
-        echoContent green "    ${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true\n"
+        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true\n"
     fi
 
 }
@@ -6627,15 +6626,29 @@ showAccounts() {
     # Snell
     if echo ${currentInstallProtocolType} | grep -q ",15,"; then
         echoContent skyBlue "\n================================  Snell ================================\n"
+        echoContent yellow " ---> Snell 所有账号共用一个 PSK，不能按用户吊销"
 
-        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${configPath}15_snell_inbounds.json") || return 1
+        # 单 PSK 模式没有 users。账号列表取自 currentClients，initSingBoxClients 也用它生成其他协议的 users
+        local snellPSK snellName snellUsers
+        snellPSK=$(jq -r '.inbounds[0].psk // empty' "${configPath}15_snell_inbounds.json") || return 1
+        [[ -n "${snellPSK}" ]] || {
+            echoContent red " ---> 无法读取 Snell PSK"
+            return 1
+        }
+        snellUsers=$(echo "${currentClients:-[]}" | jq -c '.[]?' 2>/dev/null)
+        if [[ -z "${snellUsers}" ]]; then
+            echoContent yellow " ---> 没有其他协议的账号，不生成 Snell 订阅。端口:${singBoxSnellPort}，PSK:${snellPSK}，版本:4"
+        fi
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
-            echoContent skyBlue "\n ---> 账号:$(echo "${user}" | jq -r .name)"
+            snellName=$(echo "${user}" | jq -r '.name // .email // .username // empty')
+            [[ -n "${snellName}" ]] || continue
+            snellName="$(accountUserKey "${snellName}")-snell"
+            echoContent skyBlue "\n ---> 账号:${snellName}"
             echo
-            defaultBase64Code snell "${singBoxSnellPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .userkey)" || return 1
-        done <<<"${accountUsers}"
+            defaultBase64Code snell "${singBoxSnellPort}" "${snellName}" "${snellPSK}" || return 1
+        done <<<"${snellUsers}"
 
     fi
 }
@@ -7292,14 +7305,7 @@ addUser() {
             clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
             echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
         fi
-        # snell
-        if echo "${currentInstallProtocolType}" | grep -q ",15,"; then
-            local clients=
-            clients=$(initSingBoxClients 15 "${uuid}" "${email}")
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}15_snell_inbounds.json)
-            echo "${clients}" | jq . >${configPath}15_snell_inbounds.json
-        fi
+        # snell 是单 PSK 模式，不写 users（写入会切到多用户模式，Surge 无法连接）
     done
     if ! reloadCore transaction; then
         echoContent red " ---> 用户已写入配置，但核心重载失败，请检查配置后手动重启"
@@ -7438,12 +7444,7 @@ removeUser() {
             anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
             echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
         fi
-        # Snell
-        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
-            local snellResult
-            snellResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}15_snell_inbounds.json")
-            echo "${snellResult}" | jq . >"${singBoxConfigPath}15_snell_inbounds.json"
-        fi
+        # snell 是单 PSK 模式，没有 users 可删，不能按用户吊销
         if ! reloadCore transaction; then
             echoContent red " ---> 用户已删除，但核心重载失败，请检查配置后手动重启"
             return 1

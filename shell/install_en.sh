@@ -824,8 +824,8 @@ readInstallProtocolType() {
         fi
         if echo "${row}" | grep -q snell_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}15,"
+            # The snell fragment has no tls and no users, so it cannot be frontingType (host and account source)
             if [[ "${coreInstallType}" == "2" ]]; then
-                frontingType=15_snell_inbounds
                 singBoxSnellPort=$(jq .inbounds[0].listen_port "${row}.json")
                 singBoxSnellPSK=$(jq -r '.inbounds[0].psk' "${row}.json")
             fi
@@ -3415,12 +3415,6 @@ initSingBoxClients() {
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
 
-        # snell
-        if echo "${type}" | grep -q ",15,"; then
-            currentUser="{\"userkey\":\"${uuid}\",\"name\":\"${name}-snell\"}"
-            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
-        fi
-
         if echo "${type}" | grep -q ",20,"; then
             currentUser="{\"username\":\"${uuid}\",\"password\":\"${uuid}\"}"
 
@@ -5568,6 +5562,7 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxSnellPort}")
         echoContent green "\n ---> Snell port: ${result[-1]}"
         # Reuse the existing key so reinstalling does not break clients
+        # Single-PSK mode: do not write users. With users the server authenticates by userkey, and Surge has no userkey parameter
         if [[ -z "${singBoxSnellPSK}" ]]; then
             singBoxSnellPSK=$(initSnellPSK)
         fi
@@ -5581,8 +5576,7 @@ EOF
             "listen_port": ${result[-1]},
             "psk": "${singBoxSnellPSK}",
             "version": 5,
-            "obfs_mode": "none",
-            "users": $(initSingBoxClients 15)
+            "obfs_mode": "none"
         }
     ]
 }
@@ -6154,7 +6148,13 @@ EOF
     elif [[ "${type}" == "snell" ]]; then
         echoContent yellow " ---> Snell"
         echoContent yellow " ---> Plain text (Snell)"
-        echoContent green "Protocol:Snell, address:${currentHost}, port:${port}, version:5, obfs:none, PSK:${id}, account:${email}\n"
+        # The server is v5. sing-box does not support the v5 QUIC proxy mode and its v5 wire protocol equals v4.
+        # Advertise v4 so Surge does not use the v5 QUIC proxy mode.
+        local snellHost=${currentHost}
+        if [[ -z "${snellHost}" || "${snellHost}" == "null" ]]; then
+            snellHost=$(getPublicIP)
+        fi
+        echoContent green "Protocol:Snell, address:${snellHost}, port:${port}, version:4 (the v5 server accepts v4 clients), obfs:none, PSK:${id} (shared by all accounts), account:${email}\n"
 
         # sing-box has no snell outbound, so the sing-box subscription cannot carry it. Surge only.
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
@@ -6162,11 +6162,11 @@ EOF
         fi
         mkdir -p "${outputRoot}/surge" || return 1
         cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true
+${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true
 EOF
 
         echoContent yellow " ---> Surge"
-        echoContent green "    ${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true\n"
+        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true\n"
     fi
 
 }
@@ -6611,15 +6611,29 @@ showAccounts() {
     # Snell
     if echo ${currentInstallProtocolType} | grep -q ",15,"; then
         echoContent skyBlue "\n================================  Snell ================================\n"
+        echoContent yellow " ---> All Snell accounts share one PSK. You cannot revoke Snell access per user"
 
-        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${configPath}15_snell_inbounds.json") || return 1
+        # Single-PSK mode has no users. The account list comes from currentClients, the same source initSingBoxClients uses for the other protocols
+        local snellPSK snellName snellUsers
+        snellPSK=$(jq -r '.inbounds[0].psk // empty' "${configPath}15_snell_inbounds.json") || return 1
+        [[ -n "${snellPSK}" ]] || {
+            echoContent red " ---> Cannot read the Snell PSK"
+            return 1
+        }
+        snellUsers=$(echo "${currentClients:-[]}" | jq -c '.[]?' 2>/dev/null)
+        if [[ -z "${snellUsers}" ]]; then
+            echoContent yellow " ---> No accounts from other protocols, so no Snell subscription. port:${singBoxSnellPort}, PSK:${snellPSK}, version:4"
+        fi
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
-            echoContent skyBlue "\n ---> Account:$(echo "${user}" | jq -r .name)"
+            snellName=$(echo "${user}" | jq -r '.name // .email // .username // empty')
+            [[ -n "${snellName}" ]] || continue
+            snellName="$(accountUserKey "${snellName}")-snell"
+            echoContent skyBlue "\n ---> Account:${snellName}"
             echo
-            defaultBase64Code snell "${singBoxSnellPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .userkey)" || return 1
-        done <<<"${accountUsers}"
+            defaultBase64Code snell "${singBoxSnellPort}" "${snellName}" "${snellPSK}" || return 1
+        done <<<"${snellUsers}"
 
     fi
 }
@@ -7276,14 +7290,7 @@ addUser() {
             clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
             echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
         fi
-        # snell
-        if echo "${currentInstallProtocolType}" | grep -q ",15,"; then
-            local clients=
-            clients=$(initSingBoxClients 15 "${uuid}" "${email}")
-
-            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}15_snell_inbounds.json)
-            echo "${clients}" | jq . >${configPath}15_snell_inbounds.json
-        fi
+        # snell runs in single-PSK mode. Do not write users: users switch it to multi-user mode and break Surge
     done
     if ! reloadCore transaction; then
         echoContent red " ---> User saved, but core reload failed; check the configuration before restarting"
@@ -7422,12 +7429,7 @@ removeUser() {
             anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
             echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
         fi
-        # Snell
-        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
-            local snellResult
-            snellResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}15_snell_inbounds.json")
-            echo "${snellResult}" | jq . >"${singBoxConfigPath}15_snell_inbounds.json"
-        fi
+        # snell runs in single-PSK mode. It has no users to delete and cannot revoke a single user
         if ! reloadCore transaction; then
             echoContent red " ---> User deleted, but core reload failed; check the configuration before restarting"
             return 1
