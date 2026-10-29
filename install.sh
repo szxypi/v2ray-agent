@@ -2032,6 +2032,47 @@ EOF
     fi
 }
 
+# sing-box 回落伪装站点配置
+singBoxDecoyNginxConfig() {
+    # 面板环境由面板管理站点，不额外生成配置
+    if [[ -n "${btDomain}" ]] || [[ ! -d "${nginxConfigPath}" ]]; then
+        return 0
+    fi
+    local decoyConf="${nginxConfigPath}sing_box_decoy.conf"
+    local conflictConf=
+    # 已有配置监听 127.0.0.1:31300 时复用，避免端口冲突
+    conflictConf=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31300" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
+    if [[ -n "${conflictConf}" ]]; then
+        rm -f "${decoyConf}"
+        return 0
+    fi
+    cat <<EOF >"${decoyConf}"
+server {
+    listen 127.0.0.1:31300;
+    server_name _;
+    server_tokens off;
+    root ${nginxStaticPath};
+
+    location ~ (\.zip\$|/__MACOSX) {
+        return 404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+    if isNginxRunning; then
+        if ! handleNginx stop || ! handleNginx start; then
+            rm -f "${decoyConf}"
+            handleNginx start >/dev/null 2>&1
+            echoContent red " ---> Nginx加载伪装站点回落配置失败，已回退"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # 检查ip
 checkIP() {
     echoContent skyBlue "\n ---> 检查域名ip中"
@@ -5324,6 +5365,7 @@ EOF
             "listen": "::",
             "listen_port": ${result[-1]},
             "users": $(initSingBoxClients 6),
+            "masquerade": "http://127.0.0.1:31300",
             "up_mbps":${hysteria2ClientDownloadSpeed},
             "down_mbps":${hysteria2ClientUploadSpeed},
             "tls": {
@@ -5357,6 +5399,10 @@ EOF
             "listen": "::",
             "listen_port": ${result[-1]},
             "users": $(initSingBoxClients 4),
+            "fallback": {
+                "server": "127.0.0.1",
+                "server_port": 31300
+            },
             "tls": {
                 "enabled": true,
                 "server_name":"${sslDomain}",
@@ -5487,6 +5533,10 @@ EOF
             "tls": {
                 "enabled": true,
                 "server_name":"${sslDomain}",
+                "alpn": [
+                    "h2",
+                    "http/1.1"
+                ],
                 "certificate_path": "/etc/v2ray-agent/tls/${sslDomain}.crt",
                 "key_path": "/etc/v2ray-agent/tls/${sslDomain}.key"
             }
@@ -5496,6 +5546,10 @@ EOF
 EOF
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/13_anytls_inbounds.json >/dev/null 2>&1
+    fi
+
+    if echo "${selectCustomInstallType}" | grep -qE ",4,|,6,|,13," || [[ "$1" == "all" ]]; then
+        singBoxDecoyNginxConfig
     fi
 
     if [[ -z "$3" ]]; then
