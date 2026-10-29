@@ -2427,7 +2427,7 @@ randomNum() {
         echo $((RANDOM % $2 + $1))
     fi
 }
-# 下载、解压并校验伪装站点文件
+# Download, extract and verify camouflage site files
 installNginxBlogFiles() {
     local blogType=$1
     local attempt= tmpDir= blogZip=
