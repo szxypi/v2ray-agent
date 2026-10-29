@@ -183,6 +183,8 @@ initVar() {
     singBoxHysteria2Port=
     singBoxTrojanPort=
     singBoxTuicPort=
+    singBoxSnellPort=
+    singBoxSnellPSK=
     singBoxNaivePort=
     singBoxVMessWSPort=
     singBoxVLESSWSPort=
@@ -684,6 +686,8 @@ readInstallProtocolType() {
     singBoxVLESSRealityGRPCServerName=
     singBoxAnyTLSPort=
     singBoxTuicPort=
+    singBoxSnellPort=
+    singBoxSnellPSK=
     singBoxNaivePort=
     singBoxVMessWSPort=
     singBoxSocks5Port=
@@ -816,6 +820,14 @@ readInstallProtocolType() {
             if [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=13_anytls_inbounds
                 singBoxAnyTLSPort=$(jq .inbounds[0].listen_port "${row}.json")
+            fi
+        fi
+        if echo "${row}" | grep -q snell_inbounds; then
+            currentInstallProtocolType="${currentInstallProtocolType}15,"
+            if [[ "${coreInstallType}" == "2" ]]; then
+                frontingType=15_snell_inbounds
+                singBoxSnellPort=$(jq .inbounds[0].listen_port "${row}.json")
+                singBoxSnellPSK=$(jq -r '.inbounds[0].psk' "${row}.json")
             fi
         fi
         if echo "${row}" | grep -q VMess_HTTPUpgrade_inbounds; then
@@ -1281,6 +1293,9 @@ showInstallStatus() {
         if echo ${currentInstallProtocolType} | grep -q ",14,"; then
             echoContent yellow "VLESS+XHTTP+TLS \c"
         fi
+        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+            echoContent yellow "Snell \c"
+        fi
     fi
 }
 
@@ -1322,6 +1337,9 @@ mkdirTools() {
     mkdir -p /etc/v2ray-agent/subscribe/sing-box
     mkdir -p /etc/v2ray-agent/subscribe/sing-box_profiles
     mkdir -p /etc/v2ray-agent/subscribe_local/sing-box
+
+    mkdir -p /etc/v2ray-agent/subscribe/surge
+    mkdir -p /etc/v2ray-agent/subscribe_local/surge
 
     mkdir -p /etc/v2ray-agent/xray/conf
     mkdir -p /etc/v2ray-agent/xray/reality_scan
@@ -3397,6 +3415,12 @@ initSingBoxClients() {
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
 
+        # snell
+        if echo "${type}" | grep -q ",15,"; then
+            currentUser="{\"userkey\":\"${uuid}\",\"name\":\"${name}-snell\"}"
+            users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
+        fi
+
         if echo "${type}" | grep -q ",20,"; then
             currentUser="{\"username\":\"${uuid}\",\"password\":\"${uuid}\"}"
 
@@ -4586,6 +4610,11 @@ initSingBoxPort() {
     fi
 }
 
+# Generate a Snell pre-shared key
+initSnellPSK() {
+    head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
 #Initialize Xray configuration file
 initXrayConfig() {
     echo "port:${port}"
@@ -5532,6 +5561,36 @@ EOF
         rm /etc/v2ray-agent/sing-box/conf/config/13_anytls_inbounds.json >/dev/null 2>&1
     fi
 
+    if echo "${selectCustomInstallType}" | grep -q ",15," || [[ "$1" == "all" ]]; then
+        echoContent yellow "\n================== Configure Snell ==================\n"
+        echoContent skyBlue "\nStart configuring the Snell protocol port"
+        echo
+        mapfile -t result < <(initSingBoxPort "${singBoxSnellPort}")
+        echoContent green "\n ---> Snell port: ${result[-1]}"
+        # Reuse the existing key so reinstalling does not break clients
+        if [[ -z "${singBoxSnellPSK}" ]]; then
+            singBoxSnellPSK=$(initSnellPSK)
+        fi
+        cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json
+{
+    "inbounds": [
+        {
+            "type": "snell",
+            "listen": "::",
+            "tag": "snell",
+            "listen_port": ${result[-1]},
+            "psk": "${singBoxSnellPSK}",
+            "version": 5,
+            "obfs_mode": "none",
+            "users": $(initSingBoxClients 15)
+        }
+    ]
+}
+EOF
+    elif [[ -z "$3" ]]; then
+        rm /etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json >/dev/null 2>&1
+    fi
+
     if echo "${selectCustomInstallType}" | grep -qE ",4,|,6,|,13," || [[ "$1" == "all" ]]; then
         singBoxDecoyNginxConfig
     fi
@@ -5561,6 +5620,7 @@ initSubscribeLocalConfig() {
     rm -rf /etc/v2ray-agent/subscribe_local/default/*
     rm -rf /etc/v2ray-agent/subscribe_local/clashMeta/*
     rm -rf /etc/v2ray-agent/subscribe_local/sing-box/*
+    rm -rf /etc/v2ray-agent/subscribe_local/surge/*
 }
 # General
 defaultBase64Code() {
@@ -5649,6 +5709,10 @@ EOF
       path: ${path}
       headers:
         Host: ${currentHost}
+EOF
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = vmess, ${add}, ${port}, username=${id}, ws=true, ws-path=${path}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, vmess-aead=true, skip-cert-verify=false, tfo=true
 EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vmess\",\"server\":\"${add}\",\"server_port\":${port},\"uuid\":\"${id}\",\"alter_id\":0,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"packet_encoding\":\"packetaddr\",\"transport\":{\"type\":\"ws\",\"path\":\"${path}\",\"max_early_data\":2048,\"early_data_header_name\":\"Sec-WebSocket-Protocol\"}}]" "${outputRoot}/sing-box/${user}") || return 1
 
@@ -5785,6 +5849,10 @@ EOF
     udp: true
     sni: ${currentHost}
 EOF
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = trojan, ${currentHost}, ${port}, password=${id}, sni=${currentHost}, skip-cert-verify=false, tfo=true
+EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"trojan\",\"server\":\"${currentHost}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"alpn\":[\"http/1.1\"],\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
@@ -5851,6 +5919,19 @@ EOF
     sni: ${currentHost}
     up: "${hysteria2ClientUploadSpeed} Mbps"
     down: "${hysteria2ClientDownloadSpeed} Mbps"
+EOF
+        local surgeHysteria2Port="${port%%-*}"
+        local surgePortHopping=
+        local surgeBandwidth=
+        if echo "${port}" | grep -q "-"; then
+            surgePortHopping=", port-hopping=${port//-/;}, port-hopping-interval=${hysteria2HopInterval:-60}"
+        fi
+        if [[ -n "${hysteria2ClientDownloadSpeed}" ]]; then
+            surgeBandwidth=", download-bandwidth=${hysteria2ClientDownloadSpeed}"
+        fi
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = hysteria2, ${currentHost}, ${surgeHysteria2Port}, password=${id}, sni=${currentHost}${surgeBandwidth}, skip-cert-verify=false, tfo=true${surgePortHopping}
 EOF
 
         local hysteria2Node
@@ -5980,6 +6061,10 @@ EOF
     reduce-rtt: true
     sni: ${email}
 EOF
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = tuic-v5, ${currentHost}, ${port}, uuid=${tuicUUID}, password=${tuicPassword}, alpn=h3, sni=${currentHost}, skip-cert-verify=false, tfo=true
+EOF
 
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\": \"tuic\",\"server\": \"${currentHost}\",\"server_port\": ${port},\"uuid\": \"${tuicUUID}\",\"password\": \"${tuicPassword}\",\"congestion_control\": \"${tuicAlgorithm}\",\"tls\": {\"enabled\": true,\"server_name\": \"${currentHost}\",\"alpn\": [\"h3\"]}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
@@ -6065,6 +6150,23 @@ EOF
 
         echoContent yellow " ---> QR code AnyTLS"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=anytls%3A%2F%2F${id}%40${currentHost}%3A${singBoxAnyTLSPort}%3Fpeer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%23${email}\n"
+
+    elif [[ "${type}" == "snell" ]]; then
+        echoContent yellow " ---> Snell"
+        echoContent yellow " ---> Plain text (Snell)"
+        echoContent green "Protocol:Snell, address:${currentHost}, port:${port}, version:5, obfs:none, PSK:${id}, account:${email}\n"
+
+        # sing-box has no snell outbound, so the sing-box subscription cannot carry it. Surge only.
+        if [[ ! -f "${outputRoot}/default/${user}" ]]; then
+            : >"${outputRoot}/default/${user}" || return 1
+        fi
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true
+EOF
+
+        echoContent yellow " ---> Surge"
+        echoContent green "    ${email} = snell, ${currentHost}, ${port}, psk=${id}, version=5, tfo=true\n"
     fi
 
 }
@@ -6174,7 +6276,7 @@ showAccounts() {
     if [[ -z "${accountViewKey}" ]]; then
         initSubscribeLocalConfig
     else
-        mkdir -p "${accountSubscriptionLocalRoot}/default" "${accountSubscriptionLocalRoot}/clashMeta" "${accountSubscriptionLocalRoot}/sing-box" || return 1
+        mkdir -p "${accountSubscriptionLocalRoot}/default" "${accountSubscriptionLocalRoot}/clashMeta" "${accountSubscriptionLocalRoot}/sing-box" "${accountSubscriptionLocalRoot}/surge" || return 1
     fi
     # VLESS TCP
     if echo ${currentInstallProtocolType} | grep -q ",0,"; then
@@ -6503,6 +6605,20 @@ showAccounts() {
             echoContent skyBlue "\n ---> Account :$(echo "${user}" | jq -r .name)"
             echo
             defaultBase64Code anytls "${singBoxAnyTLSPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .password)" || return 1
+        done <<<"${accountUsers}"
+
+    fi
+    # Snell
+    if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+        echoContent skyBlue "\n================================  Snell ================================\n"
+
+        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${configPath}15_snell_inbounds.json") || return 1
+        while IFS= read -r user; do
+            [[ -n "${user}" ]] || continue
+            if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
+            echoContent skyBlue "\n ---> Account:$(echo "${user}" | jq -r .name)"
+            echo
+            defaultBase64Code snell "${singBoxSnellPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .userkey)" || return 1
         done <<<"${accountUsers}"
 
     fi
@@ -7160,6 +7276,14 @@ addUser() {
             clients=$(jq -r "${userConfig} = ${clients}" ${configPath}13_anytls_inbounds.json)
             echo "${clients}" | jq . >${configPath}13_anytls_inbounds.json
         fi
+        # snell
+        if echo "${currentInstallProtocolType}" | grep -q ",15,"; then
+            local clients=
+            clients=$(initSingBoxClients 15 "${uuid}" "${email}")
+
+            clients=$(jq -r "${userConfig} = ${clients}" ${configPath}15_snell_inbounds.json)
+            echo "${clients}" | jq . >${configPath}15_snell_inbounds.json
+        fi
     done
     if ! reloadCore transaction; then
         echoContent red " ---> User saved, but core reload failed; check the configuration before restarting"
@@ -7297,6 +7421,12 @@ removeUser() {
             local anyTLSResult
             anyTLSResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}13_anytls_inbounds.json")
             echo "${anyTLSResult}" | jq . >"${singBoxConfigPath}13_anytls_inbounds.json"
+        fi
+        # Snell
+        if echo ${currentInstallProtocolType} | grep -q ",15,"; then
+            local snellResult
+            snellResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}15_snell_inbounds.json")
+            echo "${snellResult}" | jq . >"${singBoxConfigPath}15_snell_inbounds.json"
         fi
         if ! reloadCore transaction; then
             echoContent red " ---> User deleted, but core reload failed; check the configuration before restarting"
@@ -9439,6 +9569,7 @@ customSingBoxInstall() {
     echoContent yellow "10.Naive"
     echoContent yellow "11.VMess+TLS+HTTPUpgrade"
     echoContent yellow "13.anytls"
+    echoContent yellow "15.Snell"
 
     read -r -p "Please select [multiple selection], [for example: 123]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
@@ -9446,7 +9577,7 @@ customSingBoxInstall() {
         echoContent red " ---> cannot be empty"
         exit 0
     fi
-    if [[ "${selectCustomInstallType}" != "10" ]] && [[ "${selectCustomInstallType}" != "11" ]] && [[ "${selectCustomInstallType}" != "13" ]] && ((${#selectCustomInstallType} >= 2)) && ! echo "${selectCustomInstallType}" | grep -q ","; then
+    if [[ "${selectCustomInstallType}" != "10" ]] && [[ "${selectCustomInstallType}" != "11" ]] && [[ "${selectCustomInstallType}" != "13" ]] && [[ "${selectCustomInstallType}" != "15" ]] && ((${#selectCustomInstallType} >= 2)) && ! echo "${selectCustomInstallType}" | grep -q ","; then
         echoContent red " ---> Separate multiple selections with commas "
         exit 0
     fi
@@ -9879,7 +10010,7 @@ server {
     location ~ (\.zip\$|/__MACOSX) {
         return 404;
     }
-    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles|surge)/(.*) {
         default_type 'text/plain; charset=utf-8';
         alias /etc/v2ray-agent/subscribe/\$1/\$2;
     }
@@ -10341,6 +10472,54 @@ rules:
 EOF
 
 }
+# Surge subscription. Surge supports neither VLESS nor Reality, so only snell/trojan/vmess/hysteria2/tuic lines are emitted
+surgeConfig() {
+    local proxyFile=$1
+    local id=$2
+    local url=$3
+    local publishPath=${4:-/etc/v2ray-agent/subscribe}
+    local groupName="v2ray-agent"
+    local names=() line
+    local proxyLines
+
+    # Read the proxy lines first; writing the same file afterwards truncates it
+    proxyLines=$(grep ' = ' "${proxyFile}") || proxyLines=
+
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        names+=("${line%% *}")
+    done <<<"${proxyLines}"
+
+    if [[ "${#names[@]}" == "0" ]]; then
+        rm -f "${publishPath}/surge/${id}"
+        return 0
+    fi
+
+    local joined
+    joined=$(IFS=,; echo "${names[*]}")
+
+    cat <<EOF >"${publishPath}/surge/${id}"
+#!MANAGED-CONFIG ${url} interval=43200 strict=false
+
+[General]
+log-level = notify
+dns-server = 1.1.1.1, 223.5.5.5
+ipv6 = false
+skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local
+
+[Proxy]
+DIRECT = direct
+${proxyLines}
+
+[Proxy Group]
+auto = url-test, ${joined}, url=http://www.gstatic.com/generate_204, interval=300, tolerance=100
+${groupName} = select, auto, DIRECT
+
+[Rule]
+GEOIP,CN,DIRECT
+FINAL,${groupName}
+EOF
+}
 # Random salt
 initRandomSalt() {
     local chars="abcdefghijklmnopqrtuxyz"
@@ -10388,13 +10567,14 @@ viewSubscriptionByUser() {
         currentDomain="${currentHost}:${currentDefaultPort}"
     fi
     publishDir=/etc/v2ray-agent/subscribe
-    for format in default clashMetaProfiles sing-box; do
+    for format in default clashMetaProfiles sing-box surge; do
         file="${publishDir}/${format}/${emailMd5}"
         [[ -s "${file}" ]] || continue
         case "${format}" in
         default) echoContent yellow "Default subscription: ${subscribeType}://${currentDomain}/s/default/${emailMd5}" ;;
         clashMetaProfiles) echoContent yellow "Mihomo subscription: ${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" ;;
         sing-box) echoContent yellow "sing-box subscription: ${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" ;;
+        surge) echoContent yellow "Surge subscription: ${subscribeType}://${currentDomain}/s/surge/${emailMd5}" ;;
         esac
         formatFound=true
     done
@@ -10437,7 +10617,7 @@ subscribe() (
     rm -rf "${subscribePublishPath}" "${publishBackup}" "${saltBackup}" "${saltTemp}"
     exit "${status}"
     ' EXIT
-    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,sing-box,sing-box_profiles} || return 1
+    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,sing-box,sing-box_profiles,surge} || return 1
     local renewSalt=$1
     local showStatus=$2
     if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
@@ -10471,6 +10651,7 @@ subscribe() (
         rm -rf /etc/v2ray-agent/subscribe_local/default/*
         rm -rf /etc/v2ray-agent/subscribe_local/clashMeta/*
         rm -rf /etc/v2ray-agent/subscribe_local/sing-box/*
+        rm -rf /etc/v2ray-agent/subscribe_local/surge/*
         showAccounts >/dev/null || return 1
         if [[ -n $(ls /etc/v2ray-agent/subscribe_local/default/) ]]; then
             if [[ -f "/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl" && -n $(cat "/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl") ]]; then
@@ -10532,6 +10713,12 @@ subscribe() (
                         mv -f "${subscribePublishPath}/sing-box/${emailMd5}_tmp" "${subscribePublishPath}/sing-box/${emailMd5}" || return 1
                     rm -f "${subscribePublishPath}/sing-box/${emailMd5}_download"
                 fi
+                if [[ -f "/etc/v2ray-agent/subscribe_local/surge/${email}" ]]; then
+                    cp "/etc/v2ray-agent/subscribe_local/surge/${email}" "${subscribePublishPath}/surge/${emailMd5}" || return 1
+
+                    local surgeProxyUrl="${subscribeType}://${currentDomain}/s/surge/${emailMd5}"
+                    surgeConfig "${subscribePublishPath}/surge/${emailMd5}" "${emailMd5}" "${surgeProxyUrl}" "${subscribePublishPath}" || return 1
+                fi
                 if [[ -z "${showStatus}" ]]; then
                     echoContent skyBlue "\n----------Default subscription----------\n"
                     echoContent green "email:${email}\n"
@@ -10559,6 +10746,17 @@ subscribe() (
                         echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
                         if [[ "${release}" != "alpine" ]]; then
                             echo "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
+                        fi
+
+                    fi
+
+                    # surge
+                    if [[ -f "/etc/v2ray-agent/subscribe_local/surge/${email}" ]]; then
+                        echoContent skyBlue "\n----------Surge subscription ----------\n"
+                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/surge/${emailMd5}"
+                        echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/surge/${emailMd5}"
+                        if [[ "${release}" != "alpine" ]]; then
+                            echo "${subscribeType}://${currentDomain}/s/surge/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
                         fi
 
                     fi
