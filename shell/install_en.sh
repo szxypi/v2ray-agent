@@ -5819,9 +5819,11 @@ EOF
         local surgePortHopping=
         local surgeBandwidth=
         if echo "${port}" | grep -q "-"; then
-            surgePortHopping=", port-hopping=${port//-/;}, port-hopping-interval=${hysteria2HopInterval:-60}"
+            # Surge port-hopping separates ports or ranges with semicolons. A range keeps its hyphen, for example 30000-31000
+            surgePortHopping=", port-hopping=${port}, port-hopping-interval=${hysteria2HopInterval:-60}"
         fi
-        if [[ -n "${hysteria2ClientDownloadSpeed}" ]]; then
+        # With ignore_client_bandwidth the server has no up_mbps and jq returns null. Surge rejects a null bandwidth
+        if [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+$ ]]; then
             surgeBandwidth=", download-bandwidth=${hysteria2ClientDownloadSpeed}"
         fi
         mkdir -p "${outputRoot}/surge" || return 1

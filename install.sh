@@ -5835,9 +5835,11 @@ EOF
         local surgePortHopping=
         local surgeBandwidth=
         if echo "${port}" | grep -q "-"; then
-            surgePortHopping=", port-hopping=${port//-/;}, port-hopping-interval=${hysteria2HopInterval:-60}"
+            # Surge 的 port-hopping 用分号分隔多个端口或范围，范围本身保留连字符，例如 30000-31000
+            surgePortHopping=", port-hopping=${port}, port-hopping-interval=${hysteria2HopInterval:-60}"
         fi
-        if [[ -n "${hysteria2ClientDownloadSpeed}" ]]; then
+        # 服务端用 ignore_client_bandwidth 时没有 up_mbps，jq 读出 null，Surge 不接受 null 带宽
+        if [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+$ ]]; then
             surgeBandwidth=", download-bandwidth=${hysteria2ClientDownloadSpeed}"
         fi
         mkdir -p "${outputRoot}/surge" || return 1
