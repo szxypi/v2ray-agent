@@ -4530,6 +4530,76 @@ initSnellPSK() {
     head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# Snell v6 的 PSK 长度为 12–255 字节
+validSnellPSK() {
+    local psk=$1
+    ((${#psk} >= 12 && ${#psk} <= 255))
+}
+
+# 写入 Snell v6 入站片段
+# v6 用 mode 选择传输方式。obfs_mode 只属于 v5，v6 片段里出现会被 sing-box 拒绝
+# 单 PSK 模式：不写 users。写了 users 会进入多用户模式，按 userkey 鉴权，Surge 没有 userkey 参数，连接全部被拒
+writeSnellConfig() {
+    local snellConfig=$1
+    local port=$2
+    local psk=$3
+    cat <<EOF >"${snellConfig}"
+{
+    "inbounds": [
+        {
+            "type": "snell",
+            "listen": "::",
+            "tag": "snell",
+            "listen_port": ${port},
+            "psk": "${psk}",
+            "version": 6,
+            "mode": "default"
+        }
+    ]
+}
+EOF
+}
+
+# 把旧的 Snell 片段（v4/v5、obfs_mode、users、短 PSK）升级成 v6，端口与 PSK 不变
+# 新片段先在临时目录合并并校验，通过后才替换。校验失败时保留旧片段
+# 参数 1：sing-box 的 conf 目录。参数 2：restart 表示替换后重启 sing-box，其他值只写片段，由调用方重启
+upgradeSnellConfig() {
+    local configDir=${1:-/etc/v2ray-agent/sing-box/conf}
+    local restart=${2:-restart}
+    local snellConfig="${configDir}/config/15_snell_inbounds.json"
+    [[ -f "${snellConfig}" && -x /etc/v2ray-agent/sing-box/sing-box ]] || return 0
+    local snellPort snellPSK
+    snellPort=$(jq -r '.inbounds[0].listen_port // empty' "${snellConfig}") || return 1
+    snellPSK=$(jq -r '.inbounds[0].psk // empty' "${snellConfig}") || return 1
+    if jq -e '.inbounds[0] | .version == 6 and (.mode == "default" or .mode == "unshaped" or .mode == "unsafe-raw") and (has("obfs_mode") | not) and (has("users") | not)' "${snellConfig}" >/dev/null 2>&1 &&
+        validSnellPSK "${snellPSK}"; then
+        return 0
+    fi
+    [[ "${snellPort}" =~ ^[0-9]+$ ]] || return 1
+    echoContent yellow " ---> 升级 Snell 到 v6"
+    if ! validSnellPSK "${snellPSK}"; then
+        snellPSK=$(initSnellPSK)
+        echoContent yellow " ---> 旧 PSK 不足 12 字节，已重新生成，客户端需要更新订阅"
+    fi
+    local tmpDir
+    tmpDir=$(mktemp -d "${configDir}/.snell.XXXXXX") || return 1
+    mkdir -p "${tmpDir}/config" &&
+        cp -a "${configDir}/config/." "${tmpDir}/config/" &&
+        writeSnellConfig "${tmpDir}/config/15_snell_inbounds.json" "${snellPort}" "${snellPSK}" &&
+        /etc/v2ray-agent/sing-box/sing-box merge "${tmpDir}/config.json" -C "${tmpDir}/config/" -D "${configDir}/" >/dev/null 2>&1 &&
+        /etc/v2ray-agent/sing-box/sing-box check -c "${tmpDir}/config.json" -D "${configDir}/" >/dev/null 2>&1 &&
+        writeSnellConfig "${snellConfig}" "${snellPort}" "${snellPSK}"
+    local status=$?
+    rm -rf "${tmpDir}"
+    if [[ "${status}" -ne 0 ]]; then
+        echoContent red " ---> Snell v6 配置校验失败，保留原配置"
+        return 1
+    fi
+    [[ "${restart}" == "restart" ]] || return 0
+    handleSingBox stop transaction || return 1
+    handleSingBox start transaction || return 1
+}
+
 # 初始化Xray 配置文件
 initXrayConfig() {
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化Xray配置"
@@ -5478,28 +5548,16 @@ EOF
         echo
         mapfile -t result < <(initSingBoxPort "${singBoxSnellPort}")
         echoContent green "\n ---> Snell端口：${result[-1]}"
-        # 复用已有密钥，避免重新安装后客户端失效
-        # 单 PSK 模式：不写 users。写了 users 会进入多用户模式，按 userkey 鉴权，Surge 没有 userkey 参数，连接全部被拒
-        if [[ -z "${singBoxSnellPSK}" ]]; then
+        # 复用已有密钥，避免重新安装后客户端失效。v6 要求 PSK 至少 12 字节，旧密钥太短时重新生成
+        if ! validSnellPSK "${singBoxSnellPSK}"; then
             singBoxSnellPSK=$(initSnellPSK)
         fi
-        cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json
-{
-    "inbounds": [
-        {
-            "type": "snell",
-            "listen": "::",
-            "tag": "snell",
-            "listen_port": ${result[-1]},
-            "psk": "${singBoxSnellPSK}",
-            "version": 5,
-            "obfs_mode": "none"
-        }
-    ]
-}
-EOF
+        writeSnellConfig /etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json "${result[-1]}" "${singBoxSnellPSK}" || return 1
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json >/dev/null 2>&1
+    else
+        # 添加其他协议时保留 Snell 片段。旧版本的 v5 片段在这里升级，调用方随后重启 sing-box
+        upgradeSnellConfig /etc/v2ray-agent/sing-box/conf keep || return 1
     fi
 
     if echo "${selectCustomInstallType}" | grep -qE ",4,|,6,|,13," || [[ "$1" == "all" ]]; then
@@ -6072,12 +6130,12 @@ EOF
     elif [[ "${type}" == "snell" ]]; then
         echoContent yellow " ---> Snell"
         echoContent yellow " ---> 格式化明文(Snell)"
-        # 服务端是 v5。sing-box 不支持 v5 的 QUIC 代理模式，v5 线协议与 v4 相同，客户端声明 v4，避免 Surge 对 QUIC 使用 v5 QUIC 代理模式
+        # 服务端是 v6（mode default）。客户端版本必须与服务端相同，v4/v5 客户端连 v6 服务端会被拒绝
         local snellHost=${currentHost}
         if [[ -z "${snellHost}" || "${snellHost}" == "null" ]]; then
             snellHost=$(getPublicIP)
         fi
-        echoContent green "协议类型:Snell，地址:${snellHost}，端口:${port}，版本:4（服务端 v5 兼容 v4 客户端），obfs:none，PSK:${id}，账户名:${email}\n"
+        echoContent green "协议类型:Snell，地址:${snellHost}，端口:${port}，版本:6，mode:default，PSK:${id}，账户名:${email}\n"
 
         # snell 无出站协议实现，sing-box 订阅无法下发，只通过 Surge 订阅输出
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
@@ -6085,11 +6143,11 @@ EOF
         fi
         mkdir -p "${outputRoot}/surge" || return 1
         cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true
+${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
 EOF
 
         echoContent yellow " ---> Surge"
-        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true\n"
+        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true\n"
     fi
 
 }
@@ -6544,7 +6602,7 @@ showAccounts() {
         }
         snellUsers=$(echo "${currentClients:-[]}" | jq -c '.[]?' 2>/dev/null)
         if [[ -z "${snellUsers}" ]]; then
-            echoContent yellow " ---> 没有其他协议的账号，不生成 Snell 订阅。端口:${singBoxSnellPort}，PSK:${snellPSK}，版本:4"
+            echoContent yellow " ---> 没有其他协议的账号，不生成 Snell 订阅。端口:${singBoxSnellPort}，PSK:${snellPSK}，版本:6"
         fi
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
@@ -10131,6 +10189,8 @@ initRandomSalt() {
 subscribe() (
     umask 022
     readInstallProtocolType
+    # 旧版本安装的 Snell 是 v5，订阅输出 version=6，先升级服务端片段，保证订阅与服务端版本一致
+    upgradeSnellConfig /etc/v2ray-agent/sing-box/conf restart || return 1
     installSubscribe || return 1
 
     readNginxSubscribe

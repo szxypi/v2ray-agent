@@ -4510,6 +4510,76 @@ initSnellPSK() {
     head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# A Snell v6 PSK is 12-255 bytes long
+validSnellPSK() {
+    local psk=$1
+    ((${#psk} >= 12 && ${#psk} <= 255))
+}
+
+# Write the Snell v6 inbound fragment
+# v6 selects the transport with mode. obfs_mode belongs to v5 only, and sing-box rejects it in a v6 fragment
+# Single-PSK mode: do not write users. With users the server authenticates by userkey, and Surge has no userkey parameter
+writeSnellConfig() {
+    local snellConfig=$1
+    local port=$2
+    local psk=$3
+    cat <<EOF >"${snellConfig}"
+{
+    "inbounds": [
+        {
+            "type": "snell",
+            "listen": "::",
+            "tag": "snell",
+            "listen_port": ${port},
+            "psk": "${psk}",
+            "version": 6,
+            "mode": "default"
+        }
+    ]
+}
+EOF
+}
+
+# Upgrade an old Snell fragment (v4/v5, obfs_mode, users, short PSK) to v6. The port and the PSK stay the same
+# The new fragment is merged and checked in a temp dir first. If the check fails, the old fragment stays
+# Argument 1: the sing-box conf dir. Argument 2: restart restarts sing-box after the change. Any other value only writes the fragment, and the caller restarts
+upgradeSnellConfig() {
+    local configDir=${1:-/etc/v2ray-agent/sing-box/conf}
+    local restart=${2:-restart}
+    local snellConfig="${configDir}/config/15_snell_inbounds.json"
+    [[ -f "${snellConfig}" && -x /etc/v2ray-agent/sing-box/sing-box ]] || return 0
+    local snellPort snellPSK
+    snellPort=$(jq -r '.inbounds[0].listen_port // empty' "${snellConfig}") || return 1
+    snellPSK=$(jq -r '.inbounds[0].psk // empty' "${snellConfig}") || return 1
+    if jq -e '.inbounds[0] | .version == 6 and (.mode == "default" or .mode == "unshaped" or .mode == "unsafe-raw") and (has("obfs_mode") | not) and (has("users") | not)' "${snellConfig}" >/dev/null 2>&1 &&
+        validSnellPSK "${snellPSK}"; then
+        return 0
+    fi
+    [[ "${snellPort}" =~ ^[0-9]+$ ]] || return 1
+    echoContent yellow " ---> Upgrading Snell to v6"
+    if ! validSnellPSK "${snellPSK}"; then
+        snellPSK=$(initSnellPSK)
+        echoContent yellow " ---> The old PSK is shorter than 12 bytes. A new PSK was generated, so clients must update the subscription"
+    fi
+    local tmpDir
+    tmpDir=$(mktemp -d "${configDir}/.snell.XXXXXX") || return 1
+    mkdir -p "${tmpDir}/config" &&
+        cp -a "${configDir}/config/." "${tmpDir}/config/" &&
+        writeSnellConfig "${tmpDir}/config/15_snell_inbounds.json" "${snellPort}" "${snellPSK}" &&
+        /etc/v2ray-agent/sing-box/sing-box merge "${tmpDir}/config.json" -C "${tmpDir}/config/" -D "${configDir}/" >/dev/null 2>&1 &&
+        /etc/v2ray-agent/sing-box/sing-box check -c "${tmpDir}/config.json" -D "${configDir}/" >/dev/null 2>&1 &&
+        writeSnellConfig "${snellConfig}" "${snellPort}" "${snellPSK}"
+    local status=$?
+    rm -rf "${tmpDir}"
+    if [[ "${status}" -ne 0 ]]; then
+        echoContent red " ---> The Snell v6 config failed the check. The old config stays"
+        return 1
+    fi
+    [[ "${restart}" == "restart" ]] || return 0
+    handleSingBox stop transaction || return 1
+    handleSingBox start transaction || return 1
+}
+
 #Initialize Xray configuration file
 initXrayConfig() {
     echo "port:${port}"
@@ -5462,28 +5532,16 @@ EOF
         echo
         mapfile -t result < <(initSingBoxPort "${singBoxSnellPort}")
         echoContent green "\n ---> Snell port: ${result[-1]}"
-        # Reuse the existing key so reinstalling does not break clients
-        # Single-PSK mode: do not write users. With users the server authenticates by userkey, and Surge has no userkey parameter
-        if [[ -z "${singBoxSnellPSK}" ]]; then
+        # Reuse the existing key so reinstalling does not break clients. v6 needs a PSK of at least 12 bytes, so a shorter old key is replaced
+        if ! validSnellPSK "${singBoxSnellPSK}"; then
             singBoxSnellPSK=$(initSnellPSK)
         fi
-        cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json
-{
-    "inbounds": [
-        {
-            "type": "snell",
-            "listen": "::",
-            "tag": "snell",
-            "listen_port": ${result[-1]},
-            "psk": "${singBoxSnellPSK}",
-            "version": 5,
-            "obfs_mode": "none"
-        }
-    ]
-}
-EOF
+        writeSnellConfig /etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json "${result[-1]}" "${singBoxSnellPSK}" || return 1
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/15_snell_inbounds.json >/dev/null 2>&1
+    else
+        # Adding another protocol keeps the Snell fragment. An old v5 fragment is upgraded here, and the caller restarts sing-box
+        upgradeSnellConfig /etc/v2ray-agent/sing-box/conf keep || return 1
     fi
 
     if echo "${selectCustomInstallType}" | grep -qE ",4,|,6,|,13," || [[ "$1" == "all" ]]; then
@@ -6055,13 +6113,12 @@ EOF
     elif [[ "${type}" == "snell" ]]; then
         echoContent yellow " ---> Snell"
         echoContent yellow " ---> Plain text (Snell)"
-        # The server is v5. sing-box does not support the v5 QUIC proxy mode and its v5 wire protocol equals v4.
-        # Advertise v4 so Surge does not use the v5 QUIC proxy mode.
+        # The server is v6 (mode default). The client version must match the server. A v4/v5 client is rejected by a v6 server
         local snellHost=${currentHost}
         if [[ -z "${snellHost}" || "${snellHost}" == "null" ]]; then
             snellHost=$(getPublicIP)
         fi
-        echoContent green "Protocol:Snell, address:${snellHost}, port:${port}, version:4 (the v5 server accepts v4 clients), obfs:none, PSK:${id}, account:${email}\n"
+        echoContent green "Protocol:Snell, address:${snellHost}, port:${port}, version:6, mode:default, PSK:${id}, account:${email}\n"
 
         # sing-box has no snell outbound, so the sing-box subscription cannot carry it. Surge only.
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
@@ -6069,11 +6126,11 @@ EOF
         fi
         mkdir -p "${outputRoot}/surge" || return 1
         cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true
+${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
 EOF
 
         echoContent yellow " ---> Surge"
-        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=4, tfo=true\n"
+        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true\n"
     fi
 
 }
@@ -6528,7 +6585,7 @@ showAccounts() {
         }
         snellUsers=$(echo "${currentClients:-[]}" | jq -c '.[]?' 2>/dev/null)
         if [[ -z "${snellUsers}" ]]; then
-            echoContent yellow " ---> No accounts from other protocols, so no Snell subscription. port:${singBoxSnellPort}, PSK:${snellPSK}, version:4"
+            echoContent yellow " ---> No accounts from other protocols, so no Snell subscription. port:${singBoxSnellPort}, PSK:${snellPSK}, version:6"
         fi
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
@@ -10115,6 +10172,8 @@ viewSubscriptionByUser() {
 subscribe() (
     umask 022
     readInstallProtocolType
+    # Older versions installed Snell v5. The subscription emits version=6, so upgrade the server fragment first to keep them consistent
+    upgradeSnellConfig /etc/v2ray-agent/sing-box/conf restart || return 1
     installSubscribe || return 1
 
     readNginxSubscribe
