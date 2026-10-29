@@ -2386,6 +2386,33 @@ randomNum() {
         echo $((RANDOM % $2 + $1))
     fi
 }
+# 下载、解压并校验伪装站点文件
+installNginxBlogFiles() {
+    local blogType=$1
+    local attempt= tmpDir= blogZip=
+    for attempt in 1 2 3; do
+        tmpDir=$(mktemp -d) || return 1
+        blogZip="${tmpDir}/html${blogType}.zip"
+        if [[ "${release}" == "alpine" ]]; then
+            wget -q -O "${blogZip}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip" || true
+        else
+            wget -q "${wgetShowProgressStatus}" -O "${blogZip}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip" || true
+        fi
+        if [[ -s "${blogZip}" ]] && unzip -o "${blogZip}" -d "${tmpDir}" >/dev/null 2>&1 &&
+            [[ -s "${tmpDir}/index.html" ]] && ! grep -q "Welcome to nginx" "${tmpDir}/index.html"; then
+            rm -f "${blogZip}"
+            rm -rf "${tmpDir}/__MACOSX"
+            rm -rf "${nginxStaticPath:?}"*
+            if cp -a "${tmpDir}/." "${nginxStaticPath}"; then
+                rm -rf "${tmpDir}"
+                return 0
+            fi
+        fi
+        echoContent yellow " ---> 伪装站点文件下载或解压失败，正在重试(${attempt}/3)"
+        rm -rf "${tmpDir}"
+    done
+    return 1
+}
 # Nginx伪装博客
 nginxBlog() {
     if [[ -n "$1" ]]; then
@@ -2403,33 +2430,23 @@ nginxBlog() {
         fi
 
         if [[ "${nginxBlogInstallStatus}" == "y" ]]; then
-            rm -rf "${nginxStaticPath}*"
             #  randomNum=$((RANDOM % 6 + 1))
             randomNum=$(randomNum 1 9)
-            if [[ "${release}" == "alpine" ]]; then
-                wget -q -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${randomNum}.zip"
+            if installNginxBlogFiles "${randomNum}"; then
+                echoContent green " ---> 添加伪装站点成功"
             else
-                wget -q "${wgetShowProgressStatus}" -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${randomNum}.zip"
+                echoContent red " ---> 伪装站点安装失败，请检查网络后重试"
             fi
-
-            unzip -o "${nginxStaticPath}html${randomNum}.zip" -d "${nginxStaticPath}" >/dev/null
-            rm -f "${nginxStaticPath}html${randomNum}.zip*"
-            echoContent green " ---> 添加伪装站点成功"
         fi
     else
         randomNum=$(randomNum 1 9)
         #        randomNum=$((RANDOM % 6 + 1))
-        rm -rf "${nginxStaticPath}*"
 
-        if [[ "${release}" == "alpine" ]]; then
-            wget -q -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${randomNum}.zip"
+        if installNginxBlogFiles "${randomNum}"; then
+            echoContent green " ---> 添加伪装站点成功"
         else
-            wget -q "${wgetShowProgressStatus}" -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${randomNum}.zip"
+            echoContent red " ---> 伪装站点安装失败，请检查网络后重试"
         fi
-
-        unzip -o "${nginxStaticPath}html${randomNum}.zip" -d "${nginxStaticPath}" >/dev/null
-        rm -f "${nginxStaticPath}html${randomNum}.zip*"
-        echoContent green " ---> 添加伪装站点成功"
     fi
 
 }
@@ -6559,17 +6576,11 @@ updateNginxBlog() {
         fi
     fi
     if [[ "${selectInstallNginxBlogType}" =~ ^[1-9]$ ]]; then
-        rm -rf "${nginxStaticPath}*"
-
-        if [[ "${release}" == "alpine" ]]; then
-            wget -q -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${selectInstallNginxBlogType}.zip"
+        if installNginxBlogFiles "${selectInstallNginxBlogType}"; then
+            echoContent green " ---> 更换伪站成功"
         else
-            wget -q "${wgetShowProgressStatus}" -P "${nginxStaticPath}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${selectInstallNginxBlogType}.zip"
+            echoContent red " ---> 伪装站点安装失败，请检查网络后重试"
         fi
-
-        unzip -o "${nginxStaticPath}html${selectInstallNginxBlogType}.zip" -d "${nginxStaticPath}" >/dev/null
-        rm -f "${nginxStaticPath}html${selectInstallNginxBlogType}.zip*"
-        echoContent green " ---> 更换伪站成功"
     else
         echoContent red " ---> 选择错误，请重新选择"
         updateNginxBlog
