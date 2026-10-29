@@ -1853,6 +1853,9 @@ server {
 		grpc_read_timeout 1071906480m;
 		grpc_pass grpc://127.0.0.1:31304;
 	}
+	location ~ (\.zip\$|/__MACOSX) {
+		return 404;
+	}
 	location / {
     }
 }
@@ -1877,6 +1880,9 @@ server {
  		grpc_read_timeout 1071906480m;
  		grpc_send_timeout 1071906480m;
 		grpc_pass grpc://127.0.0.1:31301;
+	}
+	location ~ (\.zip\$|/__MACOSX) {
+		return 404;
 	}
 	location / {
     }
@@ -1905,6 +1911,9 @@ server {
  		grpc_send_timeout 1071906480m;
 		grpc_pass grpc://127.0.0.1:31301;
 	}
+	location ~ (\.zip\$|/__MACOSX) {
+		return 404;
+	}
 	location / {
     }
 }
@@ -1921,6 +1930,9 @@ server {
 	server_name ${domain};
 	root ${nginxStaticPath};
 
+	location ~ (\.zip\$|/__MACOSX) {
+		return 404;
+	}
 	location / {
 	}
 }
@@ -1936,6 +1948,9 @@ server {
 	real_ip_header proxy_protocol;
 
 	root ${nginxStaticPath};
+	location ~ (\.zip\$|/__MACOSX) {
+		return 404;
+	}
 	location / {
 	}
 }
@@ -1974,6 +1989,10 @@ server {
     resolver                   1.1.1.1 valid=60s;
     resolver_timeout           2s;
     client_max_body_size 100m;
+
+    location ~ (\.zip\$|/__MACOSX) {
+        return 404;
+    }
 
     location /${currentPath} {
         if (\$http_upgrade != "websocket") {
@@ -9800,6 +9819,9 @@ server {
     resolver_timeout           2s;
     client_max_body_size 100m;
     root ${nginxStaticPath};
+    location ~ (\.zip\$|/__MACOSX) {
+        return 404;
+    }
     location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles)/(.*) {
         default_type 'text/plain; charset=utf-8';
         alias /etc/v2ray-agent/subscribe/\$1/\$2;
