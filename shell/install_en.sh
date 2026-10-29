@@ -7227,7 +7227,7 @@ updateV2RayAgent() {
     echoContent skyBlue "\nProgress$1/${totalProgress}: Update v2ray-agent script"
     local scriptTemp
     scriptTemp=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
-    if ! wget -q -O "${scriptTemp}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/shell/install_en.sh" ||
+    if ! wget -q -O "${scriptTemp}" "https://raw.githubusercontent.com/szxypi/v2ray-agent/master/shell/install_en.sh" ||
         [[ ! -s "${scriptTemp}" ]] || ! bash -n "${scriptTemp}"; then
         rm -f "${scriptTemp}"
         echoContent red " ---> Script download or validation failed; keeping the current version"
@@ -7244,7 +7244,7 @@ updateV2RayAgent() {
     echoContent yellow " ---> Please manually execute [vasma] to open the script"
     echoContent green " ---> Current version: ${version}\n"
     echoContent yellow "If the update fails, please manually execute the following command\n"
-    echoContent skyBlue "wget -O /root/install.sh --no-check-certificate https://raw.githubusercontent.com/mack-a/v2ray-agent/master/shell/install_en.sh && chmod 700 /root/install.sh && /root/install.sh"
+    echoContent skyBlue "wget -O /root/install.sh --no-check-certificate https://raw.githubusercontent.com/szxypi/v2ray-agent/master/shell/install_en.sh && chmod 700 /root/install.sh && /root/install.sh"
     echo
     exit 0
 }
