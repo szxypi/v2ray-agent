@@ -9588,9 +9588,39 @@ EOF
         bootStartup nginx
         handleNginx stop
         handleNginx start
+    else
+        addSubscribeSurgeLocation "${nginxConfigPath}subscribe.conf" || return 1
     fi
     if ! isNginxRunning; then
         handleNginx start
+    fi
+}
+
+# 旧版本写的 subscribe.conf 的订阅 location 没有 surge，/s/surge/ 会返回 404
+# 只改 location 正则，保留文件里的其他手动配置。nginx -t 失败时恢复原文件
+addSubscribeSurgeLocation() {
+    local subscribeConfig=$1
+    [[ -f "${subscribeConfig}" ]] || return 0
+    grep -q 'sing-box_profiles)/' "${subscribeConfig}" || return 0
+    local backup
+    backup=$(mktemp "${subscribeConfig}.XXXXXX") || return 1
+    cp -p "${subscribeConfig}" "${backup}" || {
+        rm -f "${backup}"
+        return 1
+    }
+    sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}" || {
+        mv -f "${backup}" "${subscribeConfig}"
+        return 1
+    }
+    if ! nginx -t >/dev/null 2>&1; then
+        mv -f "${backup}" "${subscribeConfig}"
+        echoContent red " ---> subscribe.conf 增加 surge 后 nginx 校验失败，保留原文件"
+        return 1
+    fi
+    rm -f "${backup}"
+    echoContent green " ---> 订阅 location 已增加 surge"
+    if isNginxRunning; then
+        nginx -s reload >/dev/null 2>&1 || return 1
     fi
 }
 # 卸载订阅

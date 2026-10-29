@@ -9518,9 +9518,39 @@ EOF
         bootStartup nginx
         handleNginx stop
         handleNginx start
+    else
+        addSubscribeSurgeLocation "${nginxConfigPath}subscribe.conf" || return 1
     fi
     if ! isNginxRunning; then
         handleNginx start
+    fi
+}
+
+# subscribe.conf written by older versions has no surge in the subscription location, so /s/surge/ returns 404
+# Change only the location regex and keep other manual settings in the file. If nginx -t fails, restore the original file
+addSubscribeSurgeLocation() {
+    local subscribeConfig=$1
+    [[ -f "${subscribeConfig}" ]] || return 0
+    grep -q 'sing-box_profiles)/' "${subscribeConfig}" || return 0
+    local backup
+    backup=$(mktemp "${subscribeConfig}.XXXXXX") || return 1
+    cp -p "${subscribeConfig}" "${backup}" || {
+        rm -f "${backup}"
+        return 1
+    }
+    sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}" || {
+        mv -f "${backup}" "${subscribeConfig}"
+        return 1
+    }
+    if ! nginx -t >/dev/null 2>&1; then
+        mv -f "${backup}" "${subscribeConfig}"
+        echoContent red " ---> nginx check failed after adding surge to subscribe.conf. The original file stays"
+        return 1
+    fi
+    rm -f "${backup}"
+    echoContent green " ---> Added surge to the subscription location"
+    if isNginxRunning; then
+        nginx -s reload >/dev/null 2>&1 || return 1
     fi
 }
 # 卸载订阅
