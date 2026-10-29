@@ -6058,6 +6058,11 @@ EOF
     min-idle-session: 2
 EOF
 
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = anytls, ${currentHost}, ${singBoxAnyTLSPort}, password=${id}, sni=${currentHost}, skip-cert-verify=false
+EOF
+
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"anytls\",\"server\":\"${currentHost}\",\"server_port\":${singBoxAnyTLSPort},\"password\":\"${id}\",\"idle_session_check_interval\":\"30s\",\"idle_session_timeout\":\"30s\",\"min_idle_session\":2,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\"}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
@@ -10034,7 +10039,7 @@ rules:
 EOF
 
 }
-# Surge 订阅配置。Surge 不支持 VLESS 与 Reality，只输出已安装协议里的 snell/trojan/vmess/hysteria2/tuic
+# Surge 订阅配置。Surge 不支持 VLESS、Reality 与 naive，只输出已安装协议里的 snell/trojan/vmess/hysteria2/tuic/anytls
 surgeConfig() {
     local proxyFile=$1
     local id=$2

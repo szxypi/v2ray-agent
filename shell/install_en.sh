@@ -6041,6 +6041,10 @@ EOF
     idle-session-timeout: 30
     min-idle-session: 2
 EOF
+        mkdir -p "${outputRoot}/surge" || return 1
+        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
+${email} = anytls, ${currentHost}, ${singBoxAnyTLSPort}, password=${id}, sni=${currentHost}, skip-cert-verify=false
+EOF
 
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"anytls\",\"server\":\"${currentHost}\",\"server_port\":${singBoxAnyTLSPort},\"password\":\"${id}\",\"idle_session_check_interval\":\"30s\",\"idle_session_timeout\":\"30s\",\"min_idle_session\":2,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\"}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
@@ -9965,7 +9969,7 @@ rules:
 EOF
 
 }
-# Surge subscription. Surge supports neither VLESS nor Reality, so only snell/trojan/vmess/hysteria2/tuic lines are emitted
+# Surge subscription. Surge does not support VLESS, Reality or naive, so only snell/trojan/vmess/hysteria2/tuic/anytls lines are emitted
 surgeConfig() {
     local proxyFile=$1
     local id=$2
