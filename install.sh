@@ -1233,6 +1233,7 @@ mkdirTools() {
     mkdir -p /etc/v2ray-agent/subscribe/default
     mkdir -p /etc/v2ray-agent/subscribe/clashMetaProfiles
     mkdir -p /etc/v2ray-agent/subscribe/clashMeta
+    mkdir -p /etc/v2ray-agent/subscribe/clashMetaFull
 
     mkdir -p /etc/v2ray-agent/subscribe/sing-box
     mkdir -p /etc/v2ray-agent/subscribe/sing-box_profiles
@@ -5886,9 +5887,14 @@ EOF
     alpn:
         - h3
     sni: ${currentHost}
+EOF
+        # 服务端用 ignore_client_bandwidth 时带宽是 null，不写 up/down，客户端用 BBR
+        if [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+$ && "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+$ ]]; then
+            cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
     up: "${hysteria2ClientUploadSpeed} Mbps"
     down: "${hysteria2ClientDownloadSpeed} Mbps"
 EOF
+        fi
         local surgeHysteria2Port="${port%%-*}"
         local surgePortHopping=
         local surgeBandwidth=
@@ -9536,12 +9542,13 @@ viewSubscriptionByUser() {
         currentDomain="${currentHost}:${currentDefaultPort}"
     fi
     publishDir=/etc/v2ray-agent/subscribe
-    for format in default clashMetaProfiles sing-box surge; do
+    for format in default clashMetaProfiles clashMetaFull sing-box surge; do
         file="${publishDir}/${format}/${emailMd5}"
         [[ -s "${file}" ]] || continue
         case "${format}" in
         default) echoContent yellow "默认订阅: ${subscribeType}://${currentDomain}/s/default/${emailMd5}" ;;
         clashMetaProfiles) echoContent yellow "Mihomo 订阅: ${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" ;;
+        clashMetaFull) echoContent yellow "Mihomo 完整分流订阅: ${subscribeType}://${currentDomain}/s/clashMetaFull/${emailMd5}" ;;
         sing-box) echoContent yellow "sing-box 订阅: ${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" ;;
         surge) echoContent yellow "Surge 订阅: ${subscribeType}://${currentDomain}/s/surge/${emailMd5}" ;;
         esac
@@ -9635,7 +9642,7 @@ server {
     location ~ (\.zip\$|/__MACOSX) {
         return 404;
     }
-    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles|surge)/(.*) {
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|clashMetaFull|sing-box|sing-box_profiles|surge)/(.*) {
         default_type 'text/plain; charset=utf-8';
         alias /etc/v2ray-agent/subscribe/\$1/\$2;
     }
@@ -9647,36 +9654,46 @@ EOF
         handleNginx stop
         handleNginx start
     else
-        addSubscribeSurgeLocation "${nginxConfigPath}subscribe.conf" || return 1
+        addSubscribeLocations "${nginxConfigPath}subscribe.conf" || return 1
     fi
     if ! isNginxRunning; then
         handleNginx start
     fi
 }
 
-# 旧版本写的 subscribe.conf 的订阅 location 没有 surge，/s/surge/ 会返回 404
+# 旧版本写的 subscribe.conf 的订阅 location 没有 surge 和 clashMetaFull，这两个路径会返回 404
 # 只改 location 正则，保留文件里的其他手动配置。nginx -t 失败时恢复原文件
-addSubscribeSurgeLocation() {
+addSubscribeLocations() {
     local subscribeConfig=$1
     [[ -f "${subscribeConfig}" ]] || return 0
-    grep -q 'sing-box_profiles)/' "${subscribeConfig}" || return 0
+    grep -q 'sing-box_profiles' "${subscribeConfig}" || return 0
+    local formats=() format
+    grep -q '|surge)/' "${subscribeConfig}" || formats+=(surge)
+    grep -q '|clashMetaFull|' "${subscribeConfig}" || formats+=(clashMetaFull)
+    [[ "${#formats[@]}" != "0" ]] || return 0
     local backup
     backup=$(mktemp "${subscribeConfig}.XXXXXX") || return 1
     cp -p "${subscribeConfig}" "${backup}" || {
         rm -f "${backup}"
         return 1
     }
-    sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}" || {
-        mv -f "${backup}" "${subscribeConfig}"
-        return 1
-    }
+    for format in "${formats[@]}"; do
+        if [[ "${format}" == surge ]]; then
+            sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}"
+        else
+            sed -i 's#|clashMetaProfiles|#|clashMetaProfiles|clashMetaFull|#' "${subscribeConfig}"
+        fi || {
+            mv -f "${backup}" "${subscribeConfig}"
+            return 1
+        }
+    done
     if ! nginx -t >/dev/null 2>&1; then
         mv -f "${backup}" "${subscribeConfig}"
-        echoContent red " ---> subscribe.conf 增加 surge 后 nginx 校验失败，保留原文件"
+        echoContent red " ---> subscribe.conf 增加 ${formats[*]} 后 nginx 校验失败，保留原文件"
         return 1
     fi
     rm -f "${backup}"
-    echoContent green " ---> 订阅 location 已增加 surge"
+    echoContent green " ---> 订阅 location 已增加 ${formats[*]}"
     if isNginxRunning; then
         nginx -s reload >/dev/null 2>&1 || return 1
     fi
@@ -10127,6 +10144,206 @@ rules:
 EOF
 
 }
+# Mihomo 完整分流配置：节点直接写进配置，规则集用 MetaCubeX 的 mrs，DNS 防泄漏，参数按安卓客户端优化
+# 分流结构参考 qichiyuhub/rule 的 mihomo.yaml
+clashMetaFullConfig() {
+    local proxyFile=$1
+    local id=$2
+    local publishPath=${3:-/etc/v2ray-agent/subscribe}
+    [[ -s "${proxyFile}" ]] || return 0
+    local target="${publishPath}/clashMetaFull/${id}"
+    cat <<'EOF' >"${target}" || return 1
+# vasma 生成的 Mihomo 完整分流配置，要求 mihomo >= 1.19
+# 安卓优化：不加载 geo 数据库只用 mrs 规则集，健康检查用 lazy，关闭进程匹配，控制面板只监听本机
+mode: rule
+mixed-port: 7890
+allow-lan: false
+ipv6: false
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: "off"
+keep-alive-idle: 600
+keep-alive-interval: 30
+external-controller: 127.0.0.1:9090
+geodata-mode: false
+geo-auto-update: false
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: false
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
+
+# 防泄漏：国外域名只经代理向国外 DoH 查询，国内域名和节点域名用国内 DoH，不用明文 DNS 和 fallback
+hosts:
+  dns.alidns.com: [223.5.5.5, 223.6.6.6]
+  doh.pub: [1.12.12.12, 120.53.53.53]
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  cache-algorithm: arc
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - rule-set:private_domain
+    - rule-set:cn_domain
+    - "+.lan"
+    - "+.local"
+    - "+.home.arpa"
+    - "time.*.com"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+    - "time.android.com"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "connect.rom.miui.com"
+    - "localhost.ptlogin2.qq.com"
+    - "localhost.sec.qq.com"
+    - "+.cmpassport.com"
+    - "id6.me"
+    - "open.e.189.cn"
+    - "+.wosms.cn"
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    - "lancache.steamcontent.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "rule-set:private_domain,cn_domain,microsoft_cn_domain,apple_cn_domain,steam_cn_domain":
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+  nameserver:
+    - "https://1.1.1.1/dns-query#节点选择"
+    - "https://8.8.8.8/dns-query#节点选择"
+
+anchors:
+  svc: &svc {type: select, proxies: [节点选择, 自动选择, 故障转移, DIRECT], include-all-proxies: true}
+  # 规则集直连下载。首次启动时规则还没加载，不写 proxy 会走 MATCH，节点不可用时规则集永远下载不了
+  domain: &domain {type: http, behavior: domain, format: mrs, interval: 86400, proxy: DIRECT}
+  ip: &ip {type: http, behavior: ipcidr, format: mrs, interval: 86400, proxy: DIRECT}
+
+proxy-groups:
+  - {name: 节点选择, type: select, proxies: [自动选择, 故障转移, DIRECT], include-all-proxies: true}
+  - {name: 自动选择, type: url-test, include-all-proxies: true, url: "https://www.gstatic.com/generate_204", interval: 600, tolerance: 50, lazy: true}
+  - {name: 故障转移, type: fallback, include-all-proxies: true, url: "https://www.gstatic.com/generate_204", interval: 600, lazy: true}
+  - {name: AI, <<: *svc}
+  - {name: YouTube, <<: *svc}
+  - {name: Google, <<: *svc}
+  - {name: Telegram, <<: *svc}
+  - {name: GitHub, <<: *svc}
+  - {name: Microsoft, type: select, proxies: [DIRECT, 节点选择, 自动选择], include-all-proxies: true}
+  - {name: Apple, type: select, proxies: [DIRECT, 节点选择, 自动选择], include-all-proxies: true}
+  - {name: 流媒体, <<: *svc}
+  - {name: 社交媒体, <<: *svc}
+  - {name: 游戏平台, <<: *svc}
+  - {name: 广告拦截, type: select, proxies: [REJECT, DIRECT]}
+  - {name: 漏网之鱼, type: select, proxies: [节点选择, 自动选择, DIRECT], include-all-proxies: true}
+
+rule-providers:
+  private_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs", path: ./ruleset/private_domain.mrs}
+  ads_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ads-all.mrs", path: ./ruleset/ads_domain.mrs}
+  ai_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ai-!cn.mrs", path: ./ruleset/ai_domain.mrs}
+  youtube_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/youtube.mrs", path: ./ruleset/youtube_domain.mrs}
+  google_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs", path: ./ruleset/google_domain.mrs}
+  telegram_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/telegram.mrs", path: ./ruleset/telegram_domain.mrs}
+  github_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/github.mrs", path: ./ruleset/github_domain.mrs}
+  microsoft_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/microsoft@cn.mrs", path: ./ruleset/microsoft_cn_domain.mrs}
+  microsoft_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/microsoft.mrs", path: ./ruleset/microsoft_domain.mrs}
+  apple_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple-cn.mrs", path: ./ruleset/apple_cn_domain.mrs}
+  apple_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple.mrs", path: ./ruleset/apple_domain.mrs}
+  netflix_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/netflix.mrs", path: ./ruleset/netflix_domain.mrs}
+  disney_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/disney.mrs", path: ./ruleset/disney_domain.mrs}
+  hbo_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/hbo.mrs", path: ./ruleset/hbo_domain.mrs}
+  primevideo_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/primevideo.mrs", path: ./ruleset/primevideo_domain.mrs}
+  spotify_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/spotify.mrs", path: ./ruleset/spotify_domain.mrs}
+  twitter_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/twitter.mrs", path: ./ruleset/twitter_domain.mrs}
+  facebook_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/facebook.mrs", path: ./ruleset/facebook_domain.mrs}
+  instagram_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/instagram.mrs", path: ./ruleset/instagram_domain.mrs}
+  tiktok_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/tiktok.mrs", path: ./ruleset/tiktok_domain.mrs}
+  steam_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/steam@cn.mrs", path: ./ruleset/steam_cn_domain.mrs}
+  steam_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/steam.mrs", path: ./ruleset/steam_domain.mrs}
+  proxy_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/geolocation-!cn.mrs", path: ./ruleset/proxy_domain.mrs}
+  cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs", path: ./ruleset/cn_domain.mrs}
+  private_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs", path: ./ruleset/private_ip.mrs}
+  google_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/google.mrs", path: ./ruleset/google_ip.mrs}
+  telegram_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs", path: ./ruleset/telegram_ip.mrs}
+  netflix_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/netflix.mrs", path: ./ruleset/netflix_ip.mrs}
+  twitter_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/twitter.mrs", path: ./ruleset/twitter_ip.mrs}
+  facebook_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/facebook.mrs", path: ./ruleset/facebook_ip.mrs}
+  cn_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs", path: ./ruleset/cn_ip.mrs}
+
+# 先匹配域名规则，IP 规则放后面。只有最后的 cn_ip 需要解析，未知域名经代理用国外 DoH 解析，国内 DNS 看不到
+rules:
+  - RULE-SET,private_domain,DIRECT
+  - RULE-SET,ads_domain,广告拦截
+  - RULE-SET,ai_domain,AI
+  - RULE-SET,youtube_domain,YouTube
+  - RULE-SET,google_domain,Google
+  - RULE-SET,telegram_domain,Telegram
+  - RULE-SET,github_domain,GitHub
+  - RULE-SET,microsoft_cn_domain,DIRECT
+  - RULE-SET,microsoft_domain,Microsoft
+  - RULE-SET,apple_cn_domain,DIRECT
+  - RULE-SET,apple_domain,Apple
+  - RULE-SET,netflix_domain,流媒体
+  - RULE-SET,disney_domain,流媒体
+  - RULE-SET,hbo_domain,流媒体
+  - RULE-SET,primevideo_domain,流媒体
+  - RULE-SET,spotify_domain,流媒体
+  - RULE-SET,twitter_domain,社交媒体
+  - RULE-SET,facebook_domain,社交媒体
+  - RULE-SET,instagram_domain,社交媒体
+  - RULE-SET,tiktok_domain,社交媒体
+  - RULE-SET,steam_cn_domain,DIRECT
+  - RULE-SET,steam_domain,游戏平台
+  - RULE-SET,proxy_domain,节点选择
+  - RULE-SET,cn_domain,DIRECT
+  - RULE-SET,private_ip,DIRECT,no-resolve
+  - RULE-SET,google_ip,Google,no-resolve
+  - RULE-SET,telegram_ip,Telegram,no-resolve
+  - RULE-SET,netflix_ip,流媒体,no-resolve
+  - RULE-SET,twitter_ip,社交媒体,no-resolve
+  - RULE-SET,facebook_ip,社交媒体,no-resolve
+  - RULE-SET,cn_ip,DIRECT
+  - MATCH,漏网之鱼
+
+EOF
+    # 节点文件第一行是 proxies:，包含本机节点和已合并的其他机器节点
+    cat "${proxyFile}" >>"${target}" || return 1
+}
 # Surge 订阅配置。Surge 不支持 VLESS、Reality 与 naive，只输出已安装协议里的 snell/trojan/vmess/hysteria2/tuic/anytls
 surgeConfig() {
     local proxyFile=$1
@@ -10220,7 +10437,7 @@ subscribe() (
     rm -rf "${subscribePublishPath}" "${publishBackup}" "${saltBackup}" "${saltTemp}"
     exit "${status}"
     ' EXIT
-    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,sing-box,sing-box_profiles,surge} || return 1
+    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,clashMetaFull,sing-box,sing-box_profiles,surge} || return 1
     local renewSalt=$1
     local showStatus=$2
     if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
@@ -10299,6 +10516,7 @@ subscribe() (
 
                     local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
                     clashMetaConfig "${clashProxyUrl}" "${emailMd5}" "${subscribePublishPath}" || return 1
+                    clashMetaFullConfig "${subscribePublishPath}/clashMeta/${emailMd5}" "${emailMd5}" "${subscribePublishPath}" || return 1
                 fi
                 if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
                     cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "${subscribePublishPath}/sing-box_profiles/${emailMd5}" || return 1
@@ -10339,6 +10557,13 @@ subscribe() (
                         echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
                         if [[ "${release}" != "alpine" ]]; then
                             echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
+                        fi
+
+                        echoContent skyBlue "\n----------Mihomo 完整分流订阅（含 DNS 防泄漏与安卓优化）----------\n"
+                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaFull/${emailMd5}\n"
+                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaFull/${emailMd5}\n"
+                        if [[ "${release}" != "alpine" ]]; then
+                            echo "${subscribeType}://${currentDomain}/s/clashMetaFull/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
                         fi
 
                     fi
