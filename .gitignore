@@ -8,7 +8,12 @@ GEMINI.zh-CN.md
 AGENTS.md
 .worktrees/
 docs
+.playwright-mcp
 .sisyphus
 tests
 test
 checks
+/.superpowers/
+/documents/issue-1188-core-only-socks5-design.md
+/documents/issue-1305-xray-hysteria2-requirements.md
+/documents/socks5-multi-outbound-routing-design.md
