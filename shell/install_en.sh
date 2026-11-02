@@ -959,8 +959,9 @@ readSingBoxConfig() {
         hysteriaPort=$(jq -r '.inbounds[0].port' "${configPath}06_hysteria2_inbounds.json")
     fi
     if [[ -n "${hysteriaPort}" ]]; then
-        [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
-        [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+        # With ignore_client_bandwidth the server bandwidth is null. Keep null so clients use BBR. Set defaults only when no value exists
+        [[ "${hysteria2ClientUploadSpeed}" =~ ^([0-9]+([.][0-9]+)?|null)$ ]] || hysteria2ClientUploadSpeed=50
+        [[ "${hysteria2ClientDownloadSpeed}" =~ ^([0-9]+([.][0-9]+)?|null)$ ]] || hysteria2ClientDownloadSpeed=100
     fi
 }
 
