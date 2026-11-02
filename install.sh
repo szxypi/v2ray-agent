@@ -486,7 +486,8 @@ readAcmeTLS() {
 
 # 读取默认自定义端口
 readCustomPort() {
-    if [[ -n "${configPath}" && -z "${realityStatus}" && "${coreInstallType}" == "1" ]]; then
+    if [[ -n "${configPath}" && -n "${frontingType}" && -z "${realityStatus}" && "${coreInstallType}" == "1" ]] &&
+        [[ -f "${configPath}${frontingType}.json" ]]; then
         local port=
         port=$(jq -r .inbounds[0].port "${configPath}${frontingType}.json")
         if [[ "${port}" != "443" ]]; then
@@ -4689,6 +4690,8 @@ upgradeSnellConfig() {
 # 初始化Xray 配置文件
 initXrayConfig() {
     coreInstallType=1
+    configPath=/etc/v2ray-agent/xray/conf/
+    mkdir -p "${configPath}"
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化Xray配置"
     echo
     local uuid=
@@ -12268,7 +12271,7 @@ menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
     echoContent green "作者：mack-a"
-    echoContent green "当前版本：v3.5.36"
+    echoContent green "当前版本：v3.5.37"
     echoContent green "Github：https://github.com/mack-a/v2ray-agent"
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
