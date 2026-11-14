@@ -5828,6 +5828,14 @@ initSubscribeLocalConfig() {
     rm -rf /etc/v2ray-agent/subscribe_local/surge/*
 }
 # 通用
+# 追加一行 Surge 代理。outputRoot、user 来自调用方 defaultBase64Code 的局部变量
+appendSurgeProxy() {
+    mkdir -p "${outputRoot}/surge" || return 1
+    printf '%s\n' "$1" >>"${outputRoot}/surge/${user}" || return 1
+    echoContent yellow " ---> Surge"
+    echoContent green "    $1\n"
+}
+
 defaultBase64Code() {
     local type=$1
     local qrCodeBase64Default
@@ -5850,6 +5858,7 @@ defaultBase64Code() {
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${currentHost}%26host%3D${currentHost}%26fp%3Dchrome%26alpn%3Dh2%26path%3D%252F${path#/}%26mode%3D${currentXHTTPMode:-auto}%23${email}"
         printf '%s\n' "${xhttpTLSURI}" >>"${outputRoot}/default/${user}" || return 1
         buildMihomoXHTTPTLSNode "${add}" "${port}" "${id}" "${currentHost}" "${path}" "${currentXHTTPMode:-auto}" "${email}" >>"${outputRoot}/clashMeta/${user}" || return 1
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, tls=true, sni=${currentHost}, xhttp=true, xhttp-path=/${path#/}, xhttp-host=${currentHost}, xhttp-mode=${currentXHTTPMode:-auto}, skip-cert-verify=false, tfo=true" || return 1
         return 0
     fi
     if [[ ! -f "${outputRoot}/sing-box/${user}" ]]; then
@@ -5883,6 +5892,8 @@ EOF
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+TCP+TLS_Vision)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${currentHost}%3A${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26type%3Dtcp%26${currentHost}%3D${currentHost}%26headerType%3Dnone%26sni%3D${currentHost}%26flow%3Dxtls-rprx-vision%23${email}\n"
+
+        appendSurgeProxy "${email} = vless, ${currentHost}, ${port}, username=${id}, flow=xtls-rprx-vision, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
 
     elif [[ "${type}" == "vmessws" ]]; then
         qrCodeBase64Default=$(echo -n "{\"port\":${port},\"ps\":\"${email}\",\"tls\":\"tls\",\"id\":\"${id}\",\"aid\":0,\"v\":2,\"host\":\"${currentHost}\",\"type\":\"none\",\"path\":\"${path}\",\"net\":\"ws\",\"add\":\"${add}\",\"method\":\"none\",\"peer\":\"${currentHost}\",\"sni\":\"${currentHost}\"}" | base64 -w 0) || return 1
@@ -5959,6 +5970,8 @@ EOF
         echoContent yellow " ---> 二维码 VLESS(VLESS+WS+TLS)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${currentHost}%26fp%3Dchrome%26sni%3D${currentHost}%26path%3D${path}%23${email}"
 
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, ws=true, ws-path=/${path#/}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
+
     elif [[ "${type}" == "vlessXHTTP" ]]; then
 
         local xhttpMldsa65Param=
@@ -6000,6 +6013,8 @@ EOF
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+XHTTP)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
 
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, sni=${xrayVLESSRealityXHTTPServerName}, reality-public-key=${currentRealityXHTTPPublicKey}, reality-short-id=6ba85179e30d4fc2, xhttp=true, xhttp-path=/${path#/}, xhttp-host=${xrayVLESSRealityXHTTPServerName}, tfo=true" || return 1
+
     elif
         [[ "${type}" == "vlessgrpc" ]]
     then
@@ -6033,6 +6048,8 @@ EOF
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+gRPC+TLS)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dgrpc%26host%3D${currentHost}%26serviceName%3D${currentPath}grpc%26fp%3Dchrome%26path%3D${currentPath}grpc%26sni%3D${currentHost}%26alpn%3Dh2%23${email}"
+
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, grpc=true, grpc-service-name=${currentPath}grpc, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
 
     elif [[ "${type}" == "trojan" ]]; then
         # URLEncode
@@ -6205,6 +6222,8 @@ EOF
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+uTLS+Vision)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dtcp%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26flow%3Dxtls-rprx-vision%23${email}\n"
 
+        appendSurgeProxy "${email} = vless, $(getPublicIP), ${port}, username=${id}, flow=xtls-rprx-vision, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=6ba85179e30d4fc2, tfo=true" || return 1
+
     elif [[ "${type}" == "vlessRealityGRPC" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
         local publicKey=${currentRealityPublicKey}
@@ -6251,6 +6270,7 @@ EOF
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+uTLS+gRPC)"
         echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dgrpc%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26path%3Dgrpc%26serviceName%3Dgrpc%23${email}\n"
+        appendSurgeProxy "${email} = vless, $(getPublicIP), ${port}, username=${id}, grpc=true, grpc-service-name=grpc, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=6ba85179e30d4fc2, tfo=true" || return 1
     elif [[ "${type}" == "tuic" ]]; then
         local tuicUUID=
         tuicUUID=$(echo "${id}" | awk -F "[_]" '{print $1}')
@@ -6391,7 +6411,7 @@ EOF
         fi
         echoContent green "协议类型:Snell，地址:${snellHost}，端口:${port}，版本:6，mode:default，PSK:${id}，账户名:${email}\n"
 
-        # snell 无出站协议实现，sing-box 订阅无法下发，只通过 Surge 订阅输出
+        # Snell 下发到 Surge、sing-box、Mihomo 订阅。通用订阅没有 Snell 的标准链接格式
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
             : >"${outputRoot}/default/${user}" || return 1
         fi
@@ -6399,6 +6419,21 @@ EOF
         cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
 ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
 EOF
+
+        # sing-box 1.14+ 与 Mihomo v1.19.34+ 支持 Snell v6 出站
+        cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
+  - name: "${email}"
+    type: snell
+    server: ${snellHost}
+    port: ${port}
+    psk: ${id}
+    version: 6
+    mode: default
+    udp: true
+EOF
+        singBoxSubscribeLocalConfig=$(jq --arg tag "${email}" --arg server "${snellHost}" --argjson port "${port}" --arg psk "${id}" \
+            '. += [{tag:$tag,type:"snell",server:$server,server_port:$port,version:6,psk:$psk,mode:"default"}]' "${outputRoot}/sing-box/${user}") || return 1
+        echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
         echoContent yellow " ---> Surge"
         echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true\n"
@@ -12286,7 +12321,7 @@ EOF
     # 节点文件第一行是 proxies:，包含本机节点和已合并的其他机器节点
     cat "${proxyFile}" >>"${target}" || return 1
 }
-# Surge 订阅配置。Surge 不支持 VLESS、Reality 与 naive，只输出已安装协议里的 snell/trojan/vmess/hysteria2/tuic/anytls
+# Surge 订阅配置。输出已安装协议里的 snell/vless/trojan/vmess/hysteria2/tuic/anytls。VLESS 需要 Surge iOS 6.0.0+ / Mac 6.12.0+，naive 不支持
 surgeConfig() {
     local proxyFile=$1
     local id=$2
