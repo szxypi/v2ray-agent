@@ -6379,7 +6379,7 @@ EOF
         fi
         echoContent green "Protocol:Snell, address:${snellHost}, port:${port}, version:6, mode:default, PSK:${id}, account:${email}\n"
 
-        # Snell goes to the Surge, sing-box and Mihomo subscriptions. The default subscription has no standard Snell link format
+        # Snell goes to the Surge and sing-box subscriptions. The default subscription has no standard Snell link format
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
             : >"${outputRoot}/default/${user}" || return 1
         fi
@@ -6388,17 +6388,7 @@ EOF
 ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
 EOF
 
-        # sing-box 1.14+ and Mihomo v1.19.34+ support Snell v6 outbounds
-        cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
-  - name: "${email}"
-    type: snell
-    server: ${snellHost}
-    port: ${port}
-    psk: ${id}
-    version: 6
-    mode: default
-    udp: true
-EOF
+        # sing-box 1.14+ supports Snell v6 outbounds. Clash Verge Rev reports an error on the Snell node, so it is left out of the clashMeta subscription for now
         singBoxSubscribeLocalConfig=$(jq --arg tag "${email}" --arg server "${snellHost}" --argjson port "${port}" --arg psk "${id}" \
             '. += [{tag:$tag,type:"snell",server:$server,server_port:$port,version:6,psk:$psk,mode:"default"}]' "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1

@@ -6411,7 +6411,7 @@ EOF
         fi
         echoContent green "协议类型:Snell，地址:${snellHost}，端口:${port}，版本:6，mode:default，PSK:${id}，账户名:${email}\n"
 
-        # Snell 下发到 Surge、sing-box、Mihomo 订阅。通用订阅没有 Snell 的标准链接格式
+        # Snell 下发到 Surge、sing-box 订阅。通用订阅没有 Snell 的标准链接格式
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
             : >"${outputRoot}/default/${user}" || return 1
         fi
@@ -6420,17 +6420,7 @@ EOF
 ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
 EOF
 
-        # sing-box 1.14+ 与 Mihomo v1.19.34+ 支持 Snell v6 出站
-        cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
-  - name: "${email}"
-    type: snell
-    server: ${snellHost}
-    port: ${port}
-    psk: ${id}
-    version: 6
-    mode: default
-    udp: true
-EOF
+        # sing-box 1.14+ 支持 Snell v6 出站。Clash Verge Rev 更新订阅时 Snell 节点报错，暂不写入 clashMeta 订阅
         singBoxSubscribeLocalConfig=$(jq --arg tag "${email}" --arg server "${snellHost}" --argjson port "${port}" --arg psk "${id}" \
             '. += [{tag:$tag,type:"snell",server:$server,server_port:$port,version:6,psk:$psk,mode:"default"}]' "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
