@@ -2197,12 +2197,13 @@ singBoxDecoyNginxConfig() {
     if [[ -f "${decoyConf}" ]]; then
         decoyBackup=$(mktemp "${decoyConf}.XXXXXX") && cp -p "${decoyConf}" "${decoyBackup}"
     fi
-    if [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]] && [[ -f "${nginxConfigPath}alone.conf" ]]; then
+    local effectiveCore=${selectCoreType:-${coreInstallType}}
+    if [[ "${effectiveCore}" == "2" ]] && [[ -f "${nginxConfigPath}alone.conf" ]]; then
         rm -f "${nginxConfigPath}alone.conf"
     fi
-    conflictConf=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31300" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
+    conflictConf=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31300" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1 || true)
     local plainServerBlock=""
-    if [[ -z "${conflictConf}" && "${coreInstallType}" != "1" && "${selectCoreType}" != "1" ]]; then
+    if [[ -z "${conflictConf}" && "${effectiveCore}" != "1" ]]; then
         plainServerBlock="server {
     listen 127.0.0.1:31300;
     server_name _;
@@ -2224,7 +2225,7 @@ singBoxDecoyNginxConfig() {
     local sslDomain="${domain:-${currentHost}}"
     local tlsServerBlock=""
     local decoySslConflict=
-    decoySslConflict=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31443" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
+    decoySslConflict=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31443" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1 || true)
     if [[ -z "${decoySslConflict}" && -n "${sslDomain}" && -s "/etc/v2ray-agent/tls/${sslDomain}.crt" && -s "/etc/v2ray-agent/tls/${sslDomain}.key" ]]; then
         local nginxVersion= nginxSslH2="listen 127.0.0.1:31443 ssl http2;"
         nginxVersion=$(nginx -v 2>&1)
@@ -2692,13 +2693,18 @@ installNginxBlogFiles() {
 }
 
 protectNginxBlogIndex() {
+    local mode=${1:-rename}
     local indexFile="${nginxStaticPath%/}/index.html"
     command -v dpkg-divert >/dev/null 2>&1 || return 0
     if dpkg-divert --list "${indexFile}" 2>/dev/null | grep -q .; then
         return 0
     fi
     dpkg -S "${indexFile}" >/dev/null 2>&1 || return 0
-    dpkg-divert --local --rename --divert "${indexFile}.nginx-dist" --add "${indexFile}" >/dev/null 2>&1 ||
+    local renameFlag="--rename"
+    if [[ "${mode}" == "preserve" ]]; then
+        renameFlag="--no-rename"
+    fi
+    dpkg-divert --local "${renameFlag}" --divert "${indexFile}.nginx-dist" --add "${indexFile}" >/dev/null 2>&1 ||
         echoContent yellow " ---> dpkg-divert failed; nginx upgrades may overwrite the camouflage index page"
 }
 
@@ -2714,7 +2720,7 @@ ensureNginxBlog() {
     [[ -n "${btDomain}" ]] && return 0
     local indexFile="${nginxStaticPath%/}/index.html"
     if [[ -d "${nginxStaticPath}" && -s "${indexFile}" ]] && ! grep -q "Welcome to nginx" "${indexFile}"; then
-        protectNginxBlogIndex
+        protectNginxBlogIndex preserve
         return 0
     fi
     if [[ -n "$1" ]]; then
@@ -2757,7 +2763,7 @@ nginxBlog() {
                 echoContent red " ---> Failed to install the camouflage site, please check the network and try again"
             fi
         else
-            protectNginxBlogIndex
+            protectNginxBlogIndex preserve
         fi
     else
         randomNum=$(randomNum 1 9)
@@ -11076,6 +11082,7 @@ EOF
 
 # sing-box 个性化安装
 customSingBoxInstall() {
+    selectCoreType=2
     echoContent skyBlue "\n========================Personalized installation================== =========="
     echoContent yellow "0.VLESS+Vision+TCP"
     echoContent yellow "1.VLESS+TLS+WS[CDN]"
@@ -11143,6 +11150,7 @@ customSingBoxInstall() {
 
 # 一键无域名Xray-core Reality
 installXrayReality() {
+    selectCoreType=1
     selectCustomInstallType=",7,"
     readLastInstallationConfig
     unInstallSubscribe
@@ -11166,7 +11174,7 @@ installXrayReality() {
 }
 # 一键无域名sing-box Reality
 installSingBoxReality() {
-
+    selectCoreType=2
     selectCustomInstallType=",7,"
     readLastInstallationConfig
     unInstallSubscribe
@@ -11186,6 +11194,7 @@ installSingBoxReality() {
 }
 # Xray-core personalized installation
 customXrayInstall() {
+    selectCoreType=1
     echoContent skyBlue "\n========================Personalized installation================== =========="
     echoContent yellow "VLESS is prefixed and 0 is installed by default. If you only need to install 0, just select 0"
     echoContent yellow "0.VLESS+TLS_Vision+TCP[recommended]"
@@ -11314,6 +11323,7 @@ selectCoreInstall() {
 
 # xray-core installation
 xrayCoreInstall() {
+    selectCoreType=1
     readLastInstallationConfig
     unInstallSubscribe
     # checkBTPanel
@@ -11361,6 +11371,7 @@ xrayCoreInstall() {
 
 # sing-box 全部安装
 singBoxInstall() {
+    selectCoreType=2
     readLastInstallationConfig
     unInstallSubscribe
     # checkBTPanel
@@ -12515,10 +12526,10 @@ checkRealityDest() {
 
 # Initialize the ServersName available to the client
 initRealityClientServersName() {
-    local realityDestDomainList=
-    if [[ "${coreInstallType}" == "1" || "${selectCoreType}" == "1" ]]; then
+    local realityDestDomainList= effectiveCore=${selectCoreType:-${coreInstallType}}
+    if [[ "${effectiveCore}" == "1" ]]; then
         realityDestDomainList="download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.lovelive-anime.jp,academy.nvidia.com,dl.google.com,www.google-analytics.com,www.caltech.edu,www.calstatela.edu,www.suny.edu,www.suffolk.edu,www.python.org,vuejs-jp.org,vuejs.org,zh-hk.vuejs.org,react.dev,www.java.com,www.oracle.com,www.mysql.com,www.mongodb.com,redis.io,cname.vercel-dns.com,vercel-dns.com,www.swift.com,academy.nvidia.com,www.swift.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,www.umcg.nl,www.fom-international.com,www.u-can.co.jp,github.io"
-    elif [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]]; then
+    elif [[ "${effectiveCore}" == "2" ]]; then
         realityDestDomainList="download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,www.lovelive-anime.jp,academy.nvidia.com,dl.google.com,www.google-analytics.com,www.python.org,vuejs-jp.org,vuejs.org,zh-hk.vuejs.org,react.dev,www.oracle.com,www.mysql.com,www.mongodb.com,cname.vercel-dns.com,vercel-dns.com,www.swift.com,academy.nvidia.com,www.swift.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,www.fom-international.com,github.io"
     fi
     if [[ -n "${realityServerName}" && -z "${lastInstallationConfig}" ]]; then
@@ -12586,7 +12597,7 @@ initRealityClientServersName() {
 
     realityDestDomain="${realityTargetServer:-${realityServerName}}:${realityDomainPort}"
     echoContent yellow "\n ---> Client server name (SNI): ${realityServerName}, fallback target: ${realityDestDomain}\n"
-    if [[ "${realityTargetServer:-}" != "127.0.0.1" ]] && [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]]; then
+    if [[ "${realityTargetServer:-}" != "127.0.0.1" && "${effectiveCore}" == "2" ]]; then
         checkRealityDest
     fi
 }
