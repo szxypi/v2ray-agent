@@ -214,6 +214,9 @@ initVar() {
     singBoxVLESSRealityGRPCServerName=
     singBoxVLESSRealityVisionServerName=
     singBoxVLESSRealityPublicKey=
+    singBoxVLESSRealityVisionShortId=
+    singBoxVLESSRealityGRPCShortId=
+    singBoxVLESSRealityTargetServer=
 
     # xray-core reality serverName publicKey
     xrayVLESSRealityServerName=
@@ -221,9 +224,16 @@ initVar() {
     xrayVLESSRealityVisionPort=
     xrayVLESSRealityXHTTPServerName=
     xrayVLESSRealityXHTTPort=
+    xrayVLESSRealityShortId=
+    xrayVLESSRealityXHTTPShortId=
+    xrayVLESSRealityTargetServer=
     xrayVLESSXHTTPTLSPort=
     xrayVLESSXHTTPTLSServerName=
     xHTTPTLSPort=
+    realityShortId=
+    realityTargetServer=
+    _cachedPublicIPv4=
+    _cachedPublicIPv6=
     #    xrayVLESSRealityPublicKey=
 
     # interfaceName=
@@ -478,6 +488,105 @@ buildXHTTPTLSNodeName() {
     printf '%s\n' "${candidate}"
 }
 
+isPositiveNumber() {
+    local value=${1:-}
+    [[ "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v v="${value}" 'BEGIN { exit (v > 0 ? 0 : 1) }'
+}
+
+wgetDownload() {
+    local -a wgetArgs=(-q)
+    if [[ "${release}" != "alpine" && -n "${wgetShowProgressStatus:-}" ]]; then
+        wgetArgs+=("${wgetShowProgressStatus}")
+    fi
+    wget "${wgetArgs[@]}" "$@"
+}
+
+generateRealityShortId() {
+    local sid=
+    if command -v openssl >/dev/null 2>&1; then
+        sid=$(openssl rand -hex 8 2>/dev/null)
+    fi
+    if [[ ! "${sid}" =~ ^[0-9a-f]{16}$ ]] && [[ -r /proc/sys/kernel/random/uuid ]]; then
+        sid=$(tr -d '-' </proc/sys/kernel/random/uuid | head -c 16)
+    fi
+    printf '%s\n' "${sid}"
+}
+
+readRealityShortIdFromJson() {
+    local file=$1 jqExpr=$2 sid=
+    [[ -f "${file}" ]] || return 0
+    sid=$(jq -r "(${jqExpr} // []) | map(select(type == \"string\" and length > 0))[0] // empty" "${file}" 2>/dev/null)
+    printf '%s\n' "${sid}"
+}
+
+printTerminalQRCode() {
+    local label=$1 data=$2
+    echoContent yellow " ---> ${label}"
+    if [[ "${release}" != "alpine" ]] && command -v qrencode >/dev/null 2>&1; then
+        printf '%s\n' "${data}" | qrencode -s 10 -m 1 -t UTF8
+        echo
+    else
+        echoContent gray "    (qrencode not installed; copy the URI above directly)"
+    fi
+}
+
+writeSingBoxWSNginxConf() {
+    local confFile=$1 listenPort=$2 domainName=$3 wsPath=$4 upstreamPort=$5 upgradeMode=${6:-websocket}
+    local nginxH2Conf="listen ${listenPort} http2 so_keepalive=on ssl;"
+    local nginxVersion=
+    nginxVersion=$(nginx -v 2>&1)
+    if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
+        nginxH2Conf="listen ${listenPort} so_keepalive=on ssl;http2 on;"
+    fi
+    local upgradeGuard=
+    if [[ "${upgradeMode}" == "websocket" ]]; then
+        upgradeGuard='if ($http_upgrade != "websocket") { return 404; }'
+    else
+        upgradeGuard='if ($http_upgrade = "") { return 404; }'
+    fi
+    ensureNginxServerNamesHashBucketSize
+    cat <<EOF >"${confFile}"
+server {
+    ${nginxH2Conf}
+
+    server_name ${domainName};
+    server_tokens off;
+    root ${nginxStaticPath};
+    index index.html;
+    ssl_certificate /etc/v2ray-agent/tls/${domainName}.crt;
+    ssl_certificate_key /etc/v2ray-agent/tls/${domainName}.key;
+
+    ssl_protocols              TLSv1.2 TLSv1.3;
+    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers  on;
+
+    resolver                   1.1.1.1 valid=60s;
+    resolver_timeout           2s;
+    client_max_body_size 100m;
+
+    location ~ (\.zip\$|/__MACOSX) {
+        return 404;
+    }
+
+    location /${wsPath#/} {
+        ${upgradeGuard}
+        proxy_pass                          http://127.0.0.1:${upstreamPort};
+        proxy_http_version                  1.1;
+        proxy_set_header Upgrade            \$http_upgrade;
+        proxy_set_header Connection         "upgrade";
+        proxy_set_header X-Real-IP          \$remote_addr;
+        proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
+        proxy_set_header Host               \$host;
+        proxy_redirect                      off;
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+}
+
 # 读取tls证书详情
 readAcmeTLS() {
     local readAcmeDomain=
@@ -602,14 +711,19 @@ readInstallProtocolType() {
     frontingTypeReality=
     singBoxVLESSRealityVisionPort=
     singBoxVLESSRealityVisionServerName=
+    singBoxVLESSRealityVisionShortId=
     singBoxVLESSRealityGRPCPort=
     singBoxVLESSRealityGRPCServerName=
+    singBoxVLESSRealityGRPCShortId=
+    singBoxVLESSRealityTargetServer=
     singBoxAnyTLSPort=
     singBoxTuicPort=
     singBoxSnellPort=
     singBoxSnellPSK=
     singBoxNaivePort=
     singBoxVMessWSPort=
+    singBoxVLESSWSPort=
+    singBoxVMessHTTPUpgradePort=
     singBoxSocks5Port=
 
     [[ -n "${configPath}" && -d "${configPath}" ]] || return 0
@@ -626,7 +740,11 @@ readInstallProtocolType() {
             currentInstallProtocolType="${currentInstallProtocolType}1,"
             if [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=03_VLESS_WS_inbounds
-                singBoxVLESSWSPort=$(jq .inbounds[0].listen_port "${row}.json")
+                if [[ -f "${nginxConfigPath}sing_box_VLESS_WS.conf" ]]; then
+                    singBoxVLESSWSPort=$(grep -E '^[[:space:]]*listen[[:space:]]+[0-9]+' "${nginxConfigPath}sing_box_VLESS_WS.conf" 2>/dev/null | head -1 | awk '{print $2}')
+                else
+                    singBoxVLESSWSPort=$(jq .inbounds[0].listen_port "${row}.json")
+                fi
             fi
         fi
         if echo "${row}" | grep -q VLESS_XHTTP_inbounds; then
@@ -634,16 +752,11 @@ readInstallProtocolType() {
             xrayVLESSRealityXHTTPort=$(jq -r .inbounds[0].port "${row}.json")
 
             xrayVLESSRealityXHTTPServerName=$(jq -r .inbounds[0].streamSettings.realitySettings.serverNames[0] "${row}.json")
+            xrayVLESSRealityXHTTPShortId=$(readRealityShortIdFromJson "${row}.json" '.inbounds[0].streamSettings.realitySettings.shortIds')
 
             currentRealityXHTTPPublicKey=$(jq -r .inbounds[0].streamSettings.realitySettings.publicKey "${row}.json")
             currentRealityMldsa65Seed=$(jq -r '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "${row}.json")
             currentRealityMldsa65Verify=$(jq -r '.inbounds[0].streamSettings.realitySettings.mldsa65Verify // empty' "${row}.json")
-            #            currentRealityXHTTPPrivateKey=$(jq -r .inbounds[0].streamSettings.realitySettings.privateKey "${row}.json")
-
-            #            if [[ "${coreInstallType}" == "2" ]]; then
-            #                frontingType=03_VLESS_WS_inbounds
-            #                singBoxVLESSWSPort=$(jq .inbounds[0].listen_port "${row}.json")
-            #            fi
         fi
 
         if echo "${row}" | grep -q 14_VLESS_XHTTP_TLS_inbounds; then
@@ -660,7 +773,11 @@ readInstallProtocolType() {
             currentInstallProtocolType="${currentInstallProtocolType}3,"
             if [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=05_VMess_WS_inbounds
-                singBoxVMessWSPort=$(jq .inbounds[0].listen_port "${row}.json")
+                if [[ -f "${nginxConfigPath}sing_box_VMess_WS.conf" ]]; then
+                    singBoxVMessWSPort=$(grep -E '^[[:space:]]*listen[[:space:]]+[0-9]+' "${nginxConfigPath}sing_box_VMess_WS.conf" 2>/dev/null | head -1 | awk '{print $2}')
+                else
+                    singBoxVMessWSPort=$(jq .inbounds[0].listen_port "${row}.json")
+                fi
             fi
         fi
         if echo "${row}" | grep -q trojan_TCP_inbounds; then
@@ -689,7 +806,10 @@ readInstallProtocolType() {
                 realityServerName=${xrayVLESSRealityServerName}
                 xrayVLESSRealityPort=$(jq -r .inbounds[0].port "${row}.json")
 
-                realityDomainPort=$(jq -r .inbounds[1].streamSettings.realitySettings.target "${row}.json" | awk -F '[:]' '{print $2}')
+                xrayVLESSRealityTargetServer=$(jq -r '.inbounds[1].streamSettings.realitySettings.target // empty' "${row}.json" | awk -F '[:]' '{print $1}')
+                realityDomainPort=$(jq -r '.inbounds[1].streamSettings.realitySettings.target // empty' "${row}.json" | awk -F '[:]' '{print $2}')
+                realityTargetServer=${xrayVLESSRealityTargetServer}
+                xrayVLESSRealityShortId=$(readRealityShortIdFromJson "${row}.json" '.inbounds[1].streamSettings.realitySettings.shortIds')
 
                 currentRealityPublicKey=$(jq -r .inbounds[1].streamSettings.realitySettings.publicKey "${row}.json")
                 currentRealityPrivateKey=$(jq -r .inbounds[1].streamSettings.realitySettings.privateKey "${row}.json")
@@ -703,9 +823,12 @@ readInstallProtocolType() {
                 frontingTypeReality=07_VLESS_vision_reality_inbounds
                 singBoxVLESSRealityVisionPort=$(jq -r .inbounds[0].listen_port "${row}.json")
                 singBoxVLESSRealityVisionServerName=$(jq -r .inbounds[0].tls.server_name "${row}.json")
+                singBoxVLESSRealityTargetServer=$(jq -r '.inbounds[0].tls.reality.handshake.server // empty' "${row}.json")
                 realityDomainPort=$(jq -r .inbounds[0].tls.reality.handshake.server_port "${row}.json")
+                singBoxVLESSRealityVisionShortId=$(readRealityShortIdFromJson "${row}.json" '.inbounds[0].tls.reality.short_id')
 
                 realityServerName=${singBoxVLESSRealityVisionServerName}
+                realityTargetServer=${singBoxVLESSRealityTargetServer}
                 if [[ -f "${configPath}reality_key" ]]; then
                     singBoxVLESSRealityPublicKey=$(grep "publicKey" <"${configPath}reality_key" | awk -F "[:]" '{print $2}')
 
@@ -720,6 +843,10 @@ readInstallProtocolType() {
                 frontingTypeReality=08_VLESS_vision_gRPC_inbounds
                 singBoxVLESSRealityGRPCPort=$(jq -r .inbounds[0].listen_port "${row}.json")
                 singBoxVLESSRealityGRPCServerName=$(jq -r .inbounds[0].tls.server_name "${row}.json")
+                singBoxVLESSRealityGRPCShortId=$(readRealityShortIdFromJson "${row}.json" '.inbounds[0].tls.reality.short_id')
+                [[ -z "${singBoxVLESSRealityTargetServer}" ]] && singBoxVLESSRealityTargetServer=$(jq -r '.inbounds[0].tls.reality.handshake.server // empty' "${row}.json")
+                [[ -z "${realityDomainPort}" ]] && realityDomainPort=$(jq -r '.inbounds[0].tls.reality.handshake.server_port // empty' "${row}.json")
+                [[ -z "${realityTargetServer}" ]] && realityTargetServer=${singBoxVLESSRealityTargetServer}
                 if [[ -f "${configPath}reality_key" ]]; then
                     singBoxVLESSRealityPublicKey=$(grep "publicKey" <"${configPath}reality_key" | awk -F "[:]" '{print $2}')
                 fi
@@ -926,9 +1053,23 @@ getPublicIP() {
         echo "${currentHost}"
     else
         local currentIP=
-        currentIP=$(curl -s "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+        if [[ "${type}" == "4" && -n "${_cachedPublicIPv4:-}" ]]; then
+            echo "${_cachedPublicIPv4}"
+            return 0
+        elif [[ "${type}" == "6" && -n "${_cachedPublicIPv6:-}" ]]; then
+            echo "${_cachedPublicIPv6}"
+            return 0
+        fi
+        currentIP=$(curl -s --connect-timeout 3 -m 5 "-${type}" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
         if [[ -z "${currentIP}" && -z "$1" ]]; then
-            currentIP=$(curl -s "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+            currentIP=$(curl -s --connect-timeout 3 -m 5 "-6" http://www.cloudflare.com/cdn-cgi/trace | grep "ip" | awk -F "[=]" '{print $2}')
+            [[ -n "${currentIP}" ]] && _cachedPublicIPv6="${currentIP}"
+        elif [[ -n "${currentIP}" ]]; then
+            if [[ "${type}" == "6" ]]; then
+                _cachedPublicIPv6="${currentIP}"
+            else
+                _cachedPublicIPv4="${currentIP}"
+            fi
         fi
         echo "${currentIP}"
     fi
@@ -961,18 +1102,24 @@ readXrayHysteria2Network() {
     hysteria2ClientUploadSpeed=50
     hysteria2ClientDownloadSpeed=100
     [[ -f "${networkFile}" ]] || return 0
-    hysteria2ClientUploadSpeed=$(jq -r '.upload_mbps // 50' "${networkFile}") || return 1
-    hysteria2ClientDownloadSpeed=$(jq -r '.download_mbps // 100' "${networkFile}") || return 1
-    [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
-    [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+    hysteria2ClientUploadSpeed=$(jq -r 'if .upload_mbps == null then "null" else (.upload_mbps // 50) end' "${networkFile}") || return 1
+    hysteria2ClientDownloadSpeed=$(jq -r 'if .download_mbps == null then "null" else (.download_mbps // 100) end' "${networkFile}") || return 1
+    [[ "${hysteria2ClientUploadSpeed}" =~ ^([0-9]+([.][0-9]+)?|null)$ ]] || hysteria2ClientUploadSpeed=50
+    [[ "${hysteria2ClientDownloadSpeed}" =~ ^([0-9]+([.][0-9]+)?|null)$ ]] || hysteria2ClientDownloadSpeed=100
 }
 
 saveXrayHysteria2Network() {
     local networkFile=/etc/v2ray-agent/xray/hysteria2_network.json
-    [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
-    [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+    local uploadJson=null downloadJson=null
+    if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+        uploadJson="${hysteria2ClientUploadSpeed}"
+        downloadJson="${hysteria2ClientDownloadSpeed}"
+    else
+        hysteria2ClientUploadSpeed=null
+        hysteria2ClientDownloadSpeed=null
+    fi
     mkdir -p "${networkFile%/*}" || return 1
-    jq -n --argjson upload "${hysteria2ClientUploadSpeed}" --argjson download "${hysteria2ClientDownloadSpeed}" \
+    jq -n --argjson upload "${uploadJson}" --argjson download "${downloadJson}" \
         '{upload_mbps:$upload,download_mbps:$download}' >"${networkFile}.tmp" &&
         mv -f "${networkFile}.tmp" "${networkFile}"
 }
@@ -1117,9 +1264,15 @@ readConfigHostPathUUID() {
     elif [[ "${coreInstallType}" == "2" ]]; then
         if [[ -n "${frontingType}" ]]; then
             currentHost=$(jq -r .inbounds[0].tls.server_name ${configPath}${frontingType}.json)
-            if echo ${currentInstallProtocolType} | grep -q ",11," && [[ "${currentHost}" == "null" ]]; then
-                currentHost=$(grep 'server_name' "${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf" 2>/dev/null | awk '{print $2}')
-                currentHost=${currentHost//;/}
+            if [[ -z "${currentHost}" || "${currentHost}" == "null" ]]; then
+                local confName
+                for confName in sing_box_VMess_HTTPUpgrade.conf sing_box_VLESS_WS.conf sing_box_VMess_WS.conf; do
+                    if [[ -f "${nginxConfigPath}${confName}" ]]; then
+                        currentHost=$(grep 'server_name' "${nginxConfigPath}${confName}" 2>/dev/null | head -1 | awk '{print $2}')
+                        currentHost=${currentHost//;/}
+                        [[ -n "${currentHost}" ]] && break
+                    fi
+                done
             fi
             currentUUID=$(jq -r .inbounds[0].users[0].uuid ${configPath}${frontingType}.json)
             currentClients=$(jq -r .inbounds[0].users ${configPath}${frontingType}.json)
@@ -1207,9 +1360,9 @@ showInstallStatus() {
 
         elif [[ "${coreInstallType}" == 2 ]]; then
             if [[ -n $(pgrep -f "sing-box/sing-box") ]]; then
-                echoContent yellow "\nCore: v2ray-core[Running]"
+                echoContent yellow "\nCore: sing-box[Running]"
             else
-                echoContent yellow "\nCore: v2ray-core[not running]"
+                echoContent yellow "\nCore: sing-box[not running]"
             fi
         fi
         #Read protocol type
@@ -1326,10 +1479,15 @@ cleanUp() {
     if [[ "$1" == "xrayDel" ]]; then
         removeCoreService xray || return 1
         rm -rf /etc/v2ray-agent/xray/*
+        rm -f "${nginxConfigPath}alone.conf" >/dev/null 2>&1
     elif [[ "$1" == "singBoxDel" ]]; then
         removeCoreService sing-box || return 1
         rm -rf /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1
         rm -rf /etc/v2ray-agent/sing-box/conf/config/* >/dev/null 2>&1
+        rm -f "${nginxConfigPath}sing_box_decoy.conf" \
+            "${nginxConfigPath}sing_box_VLESS_WS.conf" \
+            "${nginxConfigPath}sing_box_VMess_WS.conf" \
+            "${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf" >/dev/null 2>&1
     fi
 }
 initVar "$1"
@@ -1355,6 +1513,7 @@ mkdirTools() {
     mkdir -p /etc/v2ray-agent/subscribe/default
     mkdir -p /etc/v2ray-agent/subscribe/clashMetaProfiles
     mkdir -p /etc/v2ray-agent/subscribe/clashMeta
+    mkdir -p /etc/v2ray-agent/subscribe/clashMetaFull
 
     mkdir -p /etc/v2ray-agent/subscribe/sing-box
     mkdir -p /etc/v2ray-agent/subscribe/sing-box_profiles
@@ -1642,15 +1801,11 @@ installWarp() {
         exit 0
     fi
 
-    ${installType} gnupg2 -y >/dev/null 2>&1
-    if [[ "${release}" == "debian" ]]; then
-        curl -s https://pkg.cloudflareclient.com/pubkey.gpg | sudo apt-key add - >/dev/null 2>&1
-        echo "deb http://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1
-        sudo apt update >/dev/null 2>&1
-
-    elif [[ "${release}" == "ubuntu" ]]; then
-        curl -s https://pkg.cloudflareclient.com/pubkey.gpg | sudo apt-key add - >/dev/null 2>&1
-        echo "deb http://pkg.cloudflareclient.com/ focal main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1
+    ${installType} gnupg2 ca-certificates curl lsb-release -y >/dev/null 2>&1
+    if [[ "${release}" == "debian" || "${release}" == "ubuntu" ]]; then
+        sudo mkdir -p /usr/share/keyrings >/dev/null 2>&1
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg >/dev/null 2>&1
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null 2>&1
         sudo apt update >/dev/null 2>&1
 
     elif [[ "${release}" == "centos" ]]; then
@@ -1837,8 +1992,24 @@ removeNginxDefaultConf() {
         fi
     fi
 }
+ensureNginxServerNamesHashBucketSize() {
+    local nginxMainConf=/etc/nginx/nginx.conf
+    local nginxHashConf=${nginxConfigPath}00-server-names-hash.conf
+
+    if [[ -f "${nginxMainConf}" ]] && grep -Eq '^[[:space:]]*server_names_hash_bucket_size[[:space:]]+' "${nginxMainConf}"; then
+        return 0
+    fi
+    if [[ -d "${nginxConfigPath}" ]] && grep -RqsE '^[[:space:]]*server_names_hash_bucket_size[[:space:]]+' "${nginxConfigPath}"; then
+        return 0
+    fi
+
+    if [[ "${nginxConfigPath}" == "/etc/nginx/conf.d/" || "${nginxConfigPath}" == "/etc/nginx/http.d/" ]] && [[ -d "${nginxConfigPath}" ]]; then
+        printf '%s\n' 'server_names_hash_bucket_size 64;' >"${nginxHashConf}"
+    fi
+}
 # Modify nginx redirection configuration
 updateRedirectNginxConf() {
+    ensureNginxServerNamesHashBucketSize
     local redirectDomain=
     redirectDomain=${domain}:${port}
 
@@ -2001,80 +2172,45 @@ EOF
 singBoxNginxConfig() {
     local type=$1
     local port=$2
+    local wsPath=${3:-${currentPath}}
+    local targetDomain=${sslDomain:-${domain:-${currentHost}}}
 
-    local nginxH2Conf=
-    nginxH2Conf="listen ${port} http2 so_keepalive=on ssl;"
-    nginxVersion=$(nginx -v 2>&1)
-
-    local singBoxNginxSSL=
-    singBoxNginxSSL="ssl_certificate /etc/v2ray-agent/tls/${domain}.crt;ssl_certificate_key /etc/v2ray-agent/tls/${domain}.key;"
-
-    if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
-        nginxH2Conf="listen ${port} so_keepalive=on ssl;http2 on;"
-    fi
-
-    if echo "${selectCustomInstallType}" | grep -q ",11," || [[ "$1" == "all" ]]; then
-        cat <<EOF >>${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf
-server {
-	${nginxH2Conf}
-
-	server_name ${domain};
-	root ${nginxStaticPath};
-    ${singBoxNginxSSL}
-
-    ssl_protocols              TLSv1.2 TLSv1.3;
-    ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
-    ssl_prefer_server_ciphers  on;
-
-    resolver                   1.1.1.1 valid=60s;
-    resolver_timeout           2s;
-    client_max_body_size 100m;
-
-    location ~ (\.zip\$|/__MACOSX) {
-        return 404;
-    }
-
-    location /${currentPath} {
-        if (\$http_upgrade != "websocket") {
-            return 444;
-        }
-
-        proxy_pass                          http://127.0.0.1:31306;
-        proxy_http_version                  1.1;
-        proxy_set_header Upgrade            \$http_upgrade;
-        proxy_set_header Connection         "upgrade";
-        proxy_set_header X-Real-IP          \$remote_addr;
-        proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
-        proxy_set_header Host               \$host;
-        proxy_redirect                      off;
-	}
-}
-EOF
+    if [[ "${type}" == "vless_ws" ]]; then
+        writeSingBoxWSNginxConf "${nginxConfigPath}sing_box_VLESS_WS.conf" "${port}" "${targetDomain}" "${wsPath}" 31307 websocket
+    elif [[ "${type}" == "vmess_ws" ]]; then
+        writeSingBoxWSNginxConf "${nginxConfigPath}sing_box_VMess_WS.conf" "${port}" "${targetDomain}" "${wsPath}" 31308 websocket
+    elif echo "${selectCustomInstallType}" | grep -q ",11," || [[ "${type}" == "all" ]]; then
+        writeSingBoxWSNginxConf "${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf" "${port}" "${targetDomain}" "${wsPath}" 31306 httpupgrade
     fi
 }
 
 # sing-box fallback camouflage site config
 singBoxDecoyNginxConfig() {
     # Panel environments manage sites themselves, do not generate config
-    if [[ -n "${btDomain}" ]] || [[ ! -d "${nginxConfigPath}" ]]; then
+    if [[ -n "${btDomain}" ]] || [[ ! -d "${nginxConfigPath}" ]] || ! command -v nginx >/dev/null 2>&1; then
         return 0
     fi
+    ensureNginxBlog
+    ensureNginxServerNamesHashBucketSize
     local decoyConf="${nginxConfigPath}sing_box_decoy.conf"
-    local conflictConf=
-    # Reuse existing configs already listening on 127.0.0.1:31300 to avoid port conflicts
-    conflictConf=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31300" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
-    if [[ -n "${conflictConf}" ]]; then
-        rm -f "${decoyConf}"
-        return 0
+    local decoyBackup= conflictConf=
+    if [[ -f "${decoyConf}" ]]; then
+        decoyBackup=$(mktemp "${decoyConf}.XXXXXX") && cp -p "${decoyConf}" "${decoyBackup}"
     fi
-    cat <<EOF >"${decoyConf}"
-server {
+    if [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]] && [[ -f "${nginxConfigPath}alone.conf" ]]; then
+        rm -f "${nginxConfigPath}alone.conf"
+    fi
+    conflictConf=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31300" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
+    local plainServerBlock=""
+    if [[ -z "${conflictConf}" && "${coreInstallType}" != "1" && "${selectCoreType}" != "1" ]]; then
+        plainServerBlock="server {
     listen 127.0.0.1:31300;
     server_name _;
     server_tokens off;
     root ${nginxStaticPath};
+    index index.html;
 
-    location ~ (\.zip\$|/__MACOSX) {
+    location ~ (\\.zip\$|/__MACOSX) {
         return 404;
     }
 
@@ -2082,13 +2218,68 @@ server {
         try_files \$uri \$uri/ =404;
     }
 }
-EOF
-    if isNginxRunning; then
-        if ! handleNginx stop || ! handleNginx start; then
+"
+    fi
+
+    local sslDomain="${domain:-${currentHost}}"
+    local tlsServerBlock=""
+    local decoySslConflict=
+    decoySslConflict=$(grep -RlsE "listen[[:space:]]+127\.0\.0\.1:31443" "${nginxConfigPath}" 2>/dev/null | grep -vxF "${decoyConf}" | head -n 1)
+    if [[ -z "${decoySslConflict}" && -n "${sslDomain}" && -s "/etc/v2ray-agent/tls/${sslDomain}.crt" && -s "/etc/v2ray-agent/tls/${sslDomain}.key" ]]; then
+        local nginxVersion= nginxSslH2="listen 127.0.0.1:31443 ssl http2;"
+        nginxVersion=$(nginx -v 2>&1)
+        if echo "${nginxVersion}" | grep -q "1.25" && [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $3}') -gt 0 ]] || [[ $(echo "${nginxVersion}" | awk -F "[.]" '{print $2}') -gt 25 ]]; then
+            nginxSslH2="listen 127.0.0.1:31443 ssl;
+    http2 on;"
+        fi
+        tlsServerBlock="server {
+    ${nginxSslH2}
+    server_name ${sslDomain} _;
+    server_tokens off;
+    root ${nginxStaticPath};
+    index index.html;
+
+    ssl_certificate /etc/v2ray-agent/tls/${sslDomain}.crt;
+    ssl_certificate_key /etc/v2ray-agent/tls/${sslDomain}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+
+    location ~ (\\.zip\$|/__MACOSX) {
+        return 404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+"
+    fi
+
+    if [[ -z "${plainServerBlock}" && -z "${tlsServerBlock}" ]]; then
+        rm -f "${decoyConf}" "${decoyBackup}"
+        return 0
+    fi
+
+    printf '%s%s' "${plainServerBlock}" "${tlsServerBlock}" >"${decoyConf}"
+    if ! nginx -t >/dev/null 2>&1; then
+        if [[ -n "${decoyBackup}" && -f "${decoyBackup}" ]]; then
+            mv -f "${decoyBackup}" "${decoyConf}"
+        else
             rm -f "${decoyConf}"
-            handleNginx start >/dev/null 2>&1
-            echoContent red " ---> Nginx failed to load the camouflage fallback config, reverted"
-            return 1
+        fi
+        echoContent red " ---> Nginx failed to load the camouflage fallback config, reverted"
+        return 1
+    fi
+    rm -f "${decoyBackup}"
+    if isNginxRunning; then
+        if ! nginx -s reload >/dev/null 2>&1; then
+            if ! handleNginx stop || ! handleNginx start; then
+                rm -f "${decoyConf}"
+                handleNginx start >/dev/null 2>&1
+                echoContent red " ---> Nginx failed to reload the camouflage fallback config, reverted"
+                return 1
+            fi
         fi
     fi
     return 0
@@ -2470,20 +2661,25 @@ randomNum() {
 # Download, extract and verify camouflage site files
 installNginxBlogFiles() {
     local blogType=$1
-    local attempt= tmpDir= blogZip=
+    local attempt= tmpDir= blogZip= url=
+    mkdir -p "${nginxStaticPath}" || return 1
     for attempt in 1 2 3; do
         tmpDir=$(mktemp -d) || return 1
         blogZip="${tmpDir}/html${blogType}.zip"
-        if [[ "${release}" == "alpine" ]]; then
-            wget -q -O "${blogZip}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip" || true
-        else
-            wget -q "${wgetShowProgressStatus}" -O "${blogZip}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip" || true
-        fi
+        for url in \
+            "https://raw.githubusercontent.com/szxypi/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip" \
+            "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html${blogType}.zip"; do
+            wgetDownload -O "${blogZip}" "${url}" || true
+            if [[ -s "${blogZip}" ]]; then
+                break
+            fi
+        done
         if [[ -s "${blogZip}" ]] && unzip -o "${blogZip}" -d "${tmpDir}" >/dev/null 2>&1 &&
             [[ -s "${tmpDir}/index.html" ]] && ! grep -q "Welcome to nginx" "${tmpDir}/index.html"; then
             rm -f "${blogZip}"
             rm -rf "${tmpDir}/__MACOSX"
-            rm -rf "${nginxStaticPath:?}"*
+            protectNginxBlogIndex
+            find "${nginxStaticPath}" -mindepth 1 -maxdepth 1 ! -name 'index.html.nginx-dist' -exec rm -rf {} + 2>/dev/null || true
             if cp -a "${tmpDir}/." "${nginxStaticPath}"; then
                 rm -rf "${tmpDir}"
                 return 0
@@ -2494,6 +2690,48 @@ installNginxBlogFiles() {
     done
     return 1
 }
+
+protectNginxBlogIndex() {
+    local indexFile="${nginxStaticPath%/}/index.html"
+    command -v dpkg-divert >/dev/null 2>&1 || return 0
+    if dpkg-divert --list "${indexFile}" 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    dpkg -S "${indexFile}" >/dev/null 2>&1 || return 0
+    dpkg-divert --local --rename --divert "${indexFile}.nginx-dist" --add "${indexFile}" >/dev/null 2>&1 ||
+        echoContent yellow " ---> dpkg-divert failed; nginx upgrades may overwrite the camouflage index page"
+}
+
+removeNginxBlogIndexDivert() {
+    local indexFile="${nginxStaticPath%/}/index.html"
+    command -v dpkg-divert >/dev/null 2>&1 || return 0
+    dpkg-divert --list "${indexFile}" 2>/dev/null | grep -q . || return 0
+    rm -f "${indexFile}.nginx-dist" >/dev/null 2>&1 || true
+    dpkg-divert --local --remove "${indexFile}" >/dev/null 2>&1 || true
+}
+
+ensureNginxBlog() {
+    [[ -n "${btDomain}" ]] && return 0
+    local indexFile="${nginxStaticPath%/}/index.html"
+    if [[ -d "${nginxStaticPath}" && -s "${indexFile}" ]] && ! grep -q "Welcome to nginx" "${indexFile}"; then
+        protectNginxBlogIndex
+        return 0
+    fi
+    if [[ -n "$1" ]]; then
+        echoContent skyBlue "\nProgress$1/${totalProgress}: Auto-deploying camouflage site"
+    else
+        echoContent yellow "\n ---> No valid camouflage site detected, auto-deploying"
+    fi
+    local randomBlogNum
+    randomBlogNum=$(randomNum 1 9)
+    if installNginxBlogFiles "${randomBlogNum}"; then
+        echoContent green " ---> Camouflage site deployed successfully"
+    else
+        echoContent red " ---> Failed to deploy the camouflage site, please check network and retry"
+        return 1
+    fi
+}
+
 # Nginx disguise blog
 nginxBlog() {
     if [[ -n "$1" ]]; then
@@ -2502,26 +2740,27 @@ nginxBlog() {
         echoContent yellow "\n Add a cover website "
     fi
 
-    if [[ -d "${nginxStaticPath}" && -f "${nginxStaticPath}/check" ]]; then
+    local indexFile="${nginxStaticPath%/}/index.html"
+    if [[ -d "${nginxStaticPath}" && -s "${indexFile}" ]] && ! grep -q "Welcome to nginx" "${indexFile}"; then
         echo
         if [[ -z "${lastInstallationConfig}" ]]; then
-            read -r -p "Detected installation of fake site, do you need to reinstall [y/n]:" nginxBlogInstallStatus
+            read -r -p "Detected existing camouflage site, reinstall (overwrite) it? [y/n]:" nginxBlogInstallStatus
         else
             nginxBlogInstallStatus="n"
         fi
 
         if [[ "${nginxBlogInstallStatus}" == "y" ]]; then
-            #  randomNum=$((RANDOM % 6 + 1))
             randomNum=$(randomNum 1 9)
             if installNginxBlogFiles "${randomNum}"; then
                 echoContent green " ---> Added fake site successfully"
             else
                 echoContent red " ---> Failed to install the camouflage site, please check the network and try again"
             fi
+        else
+            protectNginxBlogIndex
         fi
     else
         randomNum=$(randomNum 1 9)
-        #        randomNum=$((RANDOM % 6 + 1))
 
         if installNginxBlogFiles "${randomNum}"; then
             echoContent green " ---> Added fake site successfully"
@@ -2578,7 +2817,8 @@ handleNginx() {
     fi
 
     if [[ "$1" == "start" ]]; then
-        if echo "${selectCustomInstallType}" | grep -qwE ",7,|,8,|,7,8,"; then
+        if [[ "${selectCustomInstallType}" == ",7," || "${selectCustomInstallType}" == ",8," || "${selectCustomInstallType}" == ",7,8," || "${selectCustomInstallType}" == ",8,7," ]] &&
+            [[ "${realityTargetServer:-}" != "127.0.0.1" ]] && [[ ! -f "${nginxConfigPath}subscribe.conf" ]]; then
             return 0
         fi
         if "${nginxStatus[@]}" >/dev/null 2>&1; then
@@ -2947,13 +3187,8 @@ updateGeoSite() {
     local downloadStatus=0
     local geoTempDir
     geoTempDir=$(mktemp -d "${TMPDIR:-/tmp}/v2ray-agent-geo.XXXXXX") || return 1
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -q -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
-            wget -c -q -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
-    else
-        wget -c -q "${wgetShowProgressStatus}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
-            wget -c -q "${wgetShowProgressStatus}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
-    fi
+    wgetDownload -c -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
+        wgetDownload -c -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
     if [[ "${downloadStatus}" != 0 || ! -s "${geoTempDir}/geosite.dat" || ! -s "${geoTempDir}/geoip.dat" ]]; then
         rm -rf "${geoTempDir}"
         echoContent red " ---> GeoSite/GeoIP download failed; keeping current files"
@@ -3111,6 +3346,7 @@ installSingBoxService() {
 Description=Sing-Box Service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+ConditionPathExists=/etc/v2ray-agent/sing-box/conf/config.json
 
 [Service]
 User=root
@@ -3516,19 +3752,43 @@ initHysteriaPort() {
 
 # 初始化hysteria网络信息
 initHysteria2Network() {
+    while true; do
+        echoContent yellow " Enter the peak local download speed (Unit: Mbps; Default: 100, enter 0 for unlimited / BBR)"
+        read -r -p " Download speed :" hysteria2ClientDownloadSpeed
+        if [[ -z "${hysteria2ClientDownloadSpeed}" ]]; then
+            hysteria2ClientDownloadSpeed=100
+        fi
+        if [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echoContent green "\n ---> Download speed : ${hysteria2ClientDownloadSpeed} Mbps\n"
+            break
+        fi
+        echoContent red " ---> Please enter a valid number"
+    done
 
-    echoContent yellow " Enter the peak local download speed ( Default : 100, Unit : Mbps)"
-    read -r -p " Download speed :" hysteria2ClientDownloadSpeed
-    if [[ -z "${hysteria2ClientDownloadSpeed}" ]]; then
-        hysteria2ClientDownloadSpeed=100
-        echoContent green "\n ---> Download speed : ${hysteria2ClientDownloadSpeed}\n"
+    if ! isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+        hysteria2ClientDownloadSpeed=null
+        hysteria2ClientUploadSpeed=null
+        echoContent green " ---> Configured for BBR / ignore client bandwidth\n"
+        return 0
     fi
 
-    echoContent yellow " Enter the peak local upload speed ( Default : 50, Unit : Mbps)"
-    read -r -p " Upload speed :" hysteria2ClientUploadSpeed
-    if [[ -z "${hysteria2ClientUploadSpeed}" ]]; then
-        hysteria2ClientUploadSpeed=50
-        echoContent green "\n ---> Upload speed : ${hysteria2ClientUploadSpeed}\n"
+    while true; do
+        echoContent yellow " Enter the peak local upload speed (Unit: Mbps; Default: 50, enter 0 for unlimited / BBR)"
+        read -r -p " Upload speed :" hysteria2ClientUploadSpeed
+        if [[ -z "${hysteria2ClientUploadSpeed}" ]]; then
+            hysteria2ClientUploadSpeed=50
+        fi
+        if [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echoContent green "\n ---> Upload speed : ${hysteria2ClientUploadSpeed} Mbps\n"
+            break
+        fi
+        echoContent red " ---> Please enter a valid number"
+    done
+
+    if ! isPositiveNumber "${hysteria2ClientUploadSpeed}"; then
+        hysteria2ClientDownloadSpeed=null
+        hysteria2ClientUploadSpeed=null
+        echoContent green " ---> Configured for BBR / ignore client bandwidth\n"
     fi
 }
 
@@ -3909,11 +4169,15 @@ removeAllPortHopping() {
 
 buildSingBoxHysteria2Node() {
     local port=$1 email=$2 password=$3
-    local listenPort=${hysteriaPort}
+    local listenPort=${hysteriaPort:-${port%%-*}}
+    local speedObj='{}'
+    if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+        speedObj=$(jq -n --argjson up "${hysteria2ClientUploadSpeed}" --argjson down "${hysteria2ClientDownloadSpeed}" '{up_mbps:$up,down_mbps:$down}') || return 1
+    fi
     jq -n --arg port "${port}" --arg tag "${email}" --arg password "${password}" --arg host "${currentHost}" \
-        --argjson listenPort "${listenPort}" --argjson up "${hysteria2ClientUploadSpeed}" \
-        --argjson down "${hysteria2ClientDownloadSpeed}" --arg interval "${hysteria2HopInterval:-60}s" \
-        '{tag:$tag,type:"hysteria2",server:$host,up_mbps:$up,down_mbps:$down,password:$password,tls:{enabled:true,server_name:$host,alpn:["h3"]}} +
+        --argjson listenPort "${listenPort}" --argjson speed "${speedObj}" \
+        --arg interval "${hysteria2HopInterval:-60}s" \
+        '({tag:$tag,type:"hysteria2",server:$host} + $speed + {password:$password,tls:{enabled:true,server_name:$host,alpn:["h3"]}}) +
         (if $port | contains("-") then {server_ports:[($port | sub("-"; ":"))],hop_interval:$interval} else {server_port:$listenPort} end)'
 }
 
@@ -4517,6 +4781,7 @@ singBoxHysteria2Install() {
     selectCustomInstallType=",6,"
     initSingBoxConfig custom 2 true || return 1
     installSingBoxService 3 || return 1
+    handleNginx start || return 1
     reloadCore
     showAccounts 4
 }
@@ -4949,6 +5214,7 @@ EOF
         initXrayXHTTPort
         initRealityClientServersName
         initRealityKey
+        initRealityShortId "${xrayVLESSRealityXHTTPShortId}"
         initRealityMldsa65
         cat <<EOF >/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json
 {
@@ -4967,7 +5233,7 @@ EOF
 		"security": "reality",
 		"realitySettings": {
             "show": false,
-            "target": "${realityServerName}:${realityDomainPort}",
+            "target": "${realityTargetServer:-${realityServerName}}:${realityDomainPort}",
             "xver": 0,
             "serverNames": [
                 "${realityServerName}"
@@ -4977,10 +5243,9 @@ EOF
             "mldsa65Seed": "${realityMldsa65Seed}",
             "mldsa65Verify": "${realityMldsa65Verify}",
             "minClientVer": "1.8.2",
-            "maxTimeDiff": 70000,
+            "maxTimeDiff": 60000,
             "shortIds": [
-                "",
-                "6ba85179e30d4fc2"
+                "${realityShortId}"
             ]
         },
         "xhttpSettings": {
@@ -5009,6 +5274,17 @@ EOF
         initHysteriaPort
         initHysteria2Network
         saveXrayHysteria2Network || return 1
+        local xrayHy2Finalmask=""
+        if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+            xrayHy2Finalmask=",
+      \"finalmask\": {
+        \"quicParams\": {
+          \"congestion\": \"brutal\",
+          \"brutalUp\": \"${hysteria2ClientDownloadSpeed} mbps\",
+          \"brutalDown\": \"${hysteria2ClientUploadSpeed} mbps\"
+        }
+      }"
+        fi
         cat <<EOF >/etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
 {
   "inbounds": [{
@@ -5033,7 +5309,7 @@ EOF
           "type": "file",
           "dir": "${nginxStaticPath}"
         }
-      }
+      }${xrayHy2Finalmask}
     }
   }]
 }
@@ -5147,8 +5423,8 @@ EOF
         initXrayRealityPort
         initRealityClientServersName
         initRealityKey
+        initRealityShortId "${xrayVLESSRealityShortId}"
         initRealityMldsa65
-        echo 1
         cat <<EOF >/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json
 {
   "inbounds": [
@@ -5184,7 +5460,7 @@ EOF
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "target": "${realityServerName}:${realityDomainPort}",
+          "target": "${realityTargetServer:-${realityServerName}}:${realityDomainPort}",
           "xver": 0,
           "serverNames": [
             "${realityServerName}"
@@ -5194,10 +5470,9 @@ EOF
           "mldsa65Seed": "${realityMldsa65Seed}",
           "mldsa65Verify": "${realityMldsa65Verify}",
           "minClientVer": "1.8.2",
-          "maxTimeDiff": 70000,
+          "maxTimeDiff": 60000,
           "shortIds": [
-            "",
-            "6ba85179e30d4fc2"
+            "${realityShortId}"
           ]
         }
       },
@@ -5392,26 +5667,23 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxVLESSWSPort}")
         echoContent green "\n ---> VLESS_WS Port : ${result[-1]}"
 
-        checkDNSIP "${domain}"
+        checkDNSIP "${sslDomain}"
         removeNginxDefaultConf
         handleSingBox stop
         randomPathFunction
-        checkPortOpen "${result[-1]}" "${domain}" || return 1
+        rm -f "${nginxConfigPath}sing_box_VLESS_WS.conf" >/dev/null 2>&1
+        checkPortOpen "${result[-1]}" "${sslDomain}" || return 1
+        singBoxNginxConfig vless_ws "${result[-1]}" "/${currentPath}ws"
+        bootStartup nginx
         cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/03_VLESS_WS_inbounds.json
 {
     "inbounds":[
         {
           "type": "vless",
-          "listen":"::",
-          "listen_port":${result[-1]},
+          "listen":"127.0.0.1",
+          "listen_port":31307,
           "tag":"VLESSWS",
           "users":$(initSingBoxClients 1),
-          "tls":{
-            "server_name": "${sslDomain}",
-            "enabled": true,
-            "certificate_path": "/etc/v2ray-agent/tls/${sslDomain}.crt",
-            "key_path": "/etc/v2ray-agent/tls/${sslDomain}.key"
-          },
           "transport": {
             "type": "ws",
             "path": "/${currentPath}ws",
@@ -5424,6 +5696,7 @@ EOF
 EOF
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/03_VLESS_WS_inbounds.json >/dev/null 2>&1
+        rm -f "${nginxConfigPath}sing_box_VLESS_WS.conf" >/dev/null 2>&1
     fi
 
     if echo "${selectCustomInstallType}" | grep -q ",3," || [[ "$1" == "all" ]]; then
@@ -5433,26 +5706,23 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxVMessWSPort}")
         echoContent green "\n ---> VMess_ws Port : ${result[-1]}"
 
-        checkDNSIP "${domain}"
+        checkDNSIP "${sslDomain}"
         removeNginxDefaultConf
         handleSingBox stop
         randomPathFunction
-        checkPortOpen "${result[-1]}" "${domain}" || return 1
+        rm -f "${nginxConfigPath}sing_box_VMess_WS.conf" >/dev/null 2>&1
+        checkPortOpen "${result[-1]}" "${sslDomain}" || return 1
+        singBoxNginxConfig vmess_ws "${result[-1]}" "/${currentPath}"
+        bootStartup nginx
         cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/05_VMess_WS_inbounds.json
 {
     "inbounds":[
         {
           "type": "vmess",
-          "listen":"::",
-          "listen_port":${result[-1]},
+          "listen":"127.0.0.1",
+          "listen_port":31308,
           "tag":"VMessWS",
           "users":$(initSingBoxClients 3),
-          "tls":{
-            "server_name": "${sslDomain}",
-            "enabled": true,
-            "certificate_path": "/etc/v2ray-agent/tls/${sslDomain}.crt",
-            "key_path": "/etc/v2ray-agent/tls/${sslDomain}.key"
-          },
           "transport": {
             "type": "ws",
             "path": "/${currentPath}",
@@ -5465,6 +5735,7 @@ EOF
 EOF
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/05_VMess_WS_inbounds.json >/dev/null 2>&1
+        rm -f "${nginxConfigPath}sing_box_VMess_WS.conf" >/dev/null 2>&1
     fi
 
     # VLESS_Reality_Vision
@@ -5472,6 +5743,7 @@ EOF
         echoContent yellow "\n================= configuration VLESS+Reality+Vision =================\n"
         initRealityClientServersName
         initRealityKey
+        initRealityShortId "${singBoxVLESSRealityVisionShortId}"
         echoContent skyBlue "\n Configure VLESS+Reality+Vision protocol port "
         echo
         mapfile -t result < <(initSingBoxPort "${singBoxVLESSRealityVisionPort}")
@@ -5491,14 +5763,14 @@ EOF
         "reality": {
             "enabled": true,
             "handshake":{
-                "server": "${realityServerName}",
+                "server": "${realityTargetServer:-${realityServerName}}",
                 "server_port":${realityDomainPort}
             },
             "private_key": "${realityPrivateKey}",
             "short_id": [
-                "",
-                "6ba85179e30d4fc2"
-            ]
+                "${realityShortId}"
+            ],
+            "max_time_difference": "1m"
         }
       }
     }
@@ -5513,6 +5785,7 @@ EOF
         echoContent yellow "\n================== configuration VLESS+Reality+gRPC ==================\n"
         initRealityClientServersName
         initRealityKey
+        initRealityShortId "${singBoxVLESSRealityGRPCShortId}"
         echoContent skyBlue "\n Configure VLESS+Reality+gRPC protocol port "
         echo
         mapfile -t result < <(initSingBoxPort "${singBoxVLESSRealityGRPCPort}")
@@ -5532,14 +5805,14 @@ EOF
         "reality": {
             "enabled": true,
             "handshake":{
-                "server":"${realityServerName}",
+                "server":"${realityTargetServer:-${realityServerName}}",
                 "server_port":${realityDomainPort}
             },
             "private_key": "${realityPrivateKey}",
             "short_id": [
-                "",
-                "6ba85179e30d4fc2"
-            ]
+                "${realityShortId}"
+            ],
+            "max_time_difference": "1m"
         }
       },
       "transport": {
@@ -5561,6 +5834,15 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxHysteria2Port}")
         echoContent green "\n ---> Hysteria2 Port : ${result[-1]}"
         initHysteria2Network
+        local sbHy2BandwidthBlock=""
+        if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+            sbHy2BandwidthBlock="
+            \"up_mbps\": ${hysteria2ClientDownloadSpeed},
+            \"down_mbps\": ${hysteria2ClientUploadSpeed},"
+        else
+            sbHy2BandwidthBlock="
+            \"ignore_client_bandwidth\": true,"
+        fi
         cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json
 {
     "inbounds": [
@@ -5569,9 +5851,7 @@ EOF
             "listen": "::",
             "listen_port": ${result[-1]},
             "users": $(initSingBoxClients 6),
-            "masquerade": "http://127.0.0.1:31300",
-            "up_mbps":${hysteria2ClientDownloadSpeed},
-            "down_mbps":${hysteria2ClientUploadSpeed},
+            "masquerade": "http://127.0.0.1:31300",${sbHy2BandwidthBlock}
             "tls": {
                 "enabled": true,
                 "server_name":"${sslDomain}",
@@ -5690,13 +5970,13 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxVMessHTTPUpgradePort}")
         echoContent green "\n ---> VMess_HTTPUpgrade Port : ${result[-1]}"
 
-        checkDNSIP "${domain}"
+        checkDNSIP "${sslDomain}"
         removeNginxDefaultConf
         handleSingBox stop
         randomPathFunction
         rm -rf "${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf" >/dev/null 2>&1
-        checkPortOpen "${result[-1]}" "${domain}" || return 1
-        singBoxNginxConfig "$1" "${result[-1]}"
+        checkPortOpen "${result[-1]}" "${sslDomain}" || return 1
+        singBoxNginxConfig "$1" "${result[-1]}" "/${currentPath}"
         bootStartup nginx
         cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/11_VMess_HTTPUpgrade_inbounds.json
 {
@@ -5770,7 +6050,7 @@ EOF
         upgradeSnellConfig /etc/v2ray-agent/sing-box/conf keep || return 1
     fi
 
-    if echo "${selectCustomInstallType}" | grep -qE ",4,|,6,|,13," || [[ "$1" == "all" ]]; then
+    if echo "${selectCustomInstallType}" | grep -qE ",1,|,3,|,4,|,6,|,11,|,13," || [[ "${realityTargetServer:-}" == "127.0.0.1" ]] || [[ "$1" == "all" ]]; then
         singBoxDecoyNginxConfig
     fi
 
@@ -5828,11 +6108,9 @@ defaultBase64Code() {
         echoContent green "    ${xhttpTLSURI}"
         echoContent yellow " ---> Formatted details (VLESS+XHTTP+TLS)"
         echoContent green " Protocol :VLESS, Address :${add}, Server name /SNI:${currentHost}, Port :${port}, User ID:${id}, Security :tls, Transport :xhttp, Path :${path}, Mode :${currentXHTTPMode:-auto}, Account :${email}\n"
-        echoContent yellow " ---> QR code VLESS(VLESS+XHTTP+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dxhttp%26sni%3D${currentHost}%26host%3D${currentHost}%26fp%3Dchrome%26alpn%3Dh2%26path%3D%252F${path#/}%26mode%3D${currentXHTTPMode:-auto}%23${email}"
+        printTerminalQRCode "QR code VLESS(VLESS+XHTTP+TLS)" "${xhttpTLSURI}"
         printf '%s\n' "${xhttpTLSURI}" >>"${outputRoot}/default/${user}" || return 1
         buildMihomoXHTTPTLSNode "${add}" "${port}" "${id}" "${currentHost}" "${path}" "${currentXHTTPMode:-auto}" "${email}" >>"${outputRoot}/clashMeta/${user}" || return 1
-        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, tls=true, sni=${currentHost}, xhttp=true, xhttp-path=/${path#/}, xhttp-host=${currentHost}, xhttp-mode=${currentXHTTPMode:-auto}, skip-cert-verify=false, tfo=true" || return 1
         return 0
     fi
     if [[ ! -f "${outputRoot}/sing-box/${user}" ]]; then
@@ -5840,15 +6118,13 @@ defaultBase64Code() {
     fi
     local singBoxSubscribeLocalConfig=
     if [[ "${type}" == "vlesstcp" ]]; then
-
+        local vlessTcpURI="vless://${id}@${currentHost}:${port}?encryption=none&security=tls&type=tcp&host=${currentHost}&fp=chrome&headerType=none&sni=${currentHost}&flow=xtls-rprx-vision#${email}"
         echoContent yellow " ---> Universal format (VLESS+TCP+TLS_Vision)"
-        echoContent green "    vless://${id}@${currentHost}:${port}?encryption=none&security=tls&fp=chrome&type=tcp&host=${currentHost}&headerType=none&sni=${currentHost}&flow=xtls-rprx-vision#${email}\n"
+        echoContent green "    ${vlessTcpURI}\n"
 
         echoContent yellow " ---> Formatted plain text (VLESS+TCP+TLS_Vision)"
         echoContent green " Protocol :VLESS, Address :${currentHost}, Port :${port}, User ID:${id}, Security :tls, client-fingerprint: chrome, Transport :tcp, flow:xtls-rprx-vision, Account :${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@${currentHost}:${port}?encryption=none&security=tls&type=tcp&host=${currentHost}&fp=chrome&headerType=none&sni=${currentHost}&flow=xtls-rprx-vision#${email}
-EOF
+        printf '%s\n' "${vlessTcpURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vless
@@ -5864,10 +6140,9 @@ EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"${currentHost}\",\"server_port\":${port},\"uuid\":\"${id}\",\"flow\":\"xtls-rprx-vision\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"packet_encoding\":\"xudp\"}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> Formatted plain text (VLESS+TCP+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${currentHost}%3A${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26type%3Dtcp%26${currentHost}%3D${currentHost}%26headerType%3Dnone%26sni%3D${currentHost}%26flow%3Dxtls-rprx-vision%23${email}\n"
+        printTerminalQRCode "QR code VLESS(VLESS+TCP+TLS)" "${vlessTcpURI}"
 
-        appendSurgeProxy "${email} = vless, ${currentHost}, ${port}, username=${id}, flow=xtls-rprx-vision, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
+        appendSurgeProxy "${email} = vless, ${currentHost}, ${port}, username=${id}, flow=xtls-rprx-vision, tls=true, sni=${currentHost}, skip-cert-verify=false" || return 1
 
     elif [[ "${type}" == "vmessws" ]]; then
         qrCodeBase64Default=$(echo -n "{\"port\":${port},\"ps\":\"${email}\",\"tls\":\"tls\",\"id\":\"${id}\",\"aid\":0,\"v\":2,\"host\":\"${currentHost}\",\"type\":\"none\",\"path\":\"${path}\",\"net\":\"ws\",\"add\":\"${add}\",\"method\":\"none\",\"peer\":\"${currentHost}\",\"sni\":\"${currentHost}\"}" | base64 -w 0) || return 1
@@ -5877,11 +6152,8 @@ EOF
         echoContent green "    {\"port\":${port},\"ps\":\"${email}\",\"tls\":\"tls\",\"id\":\"${id}\",\"aid\":0,\"v\":2,\"host\":\"${currentHost}\",\"type\":\"none\",\"path\":\"${path}\",\"net\":\"ws\",\"add\":\"${add}\",\"method\":\"none\",\"peer\":\"${currentHost}\",\"sni\":\"${currentHost}\"}\n"
         echoContent yellow " ---> Universal vmess (VMess+WS+TLS) link"
         echoContent green "    vmess://${qrCodeBase64Default}\n"
-        echoContent yellow " ---> QR code vmess(VMess+WS+TLS)"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vmess://${qrCodeBase64Default}
-EOF
+        printf 'vmess://%s\n' "${qrCodeBase64Default}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vmess
@@ -5900,27 +6172,22 @@ EOF
       headers:
         Host: ${currentHost}
 EOF
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = vmess, ${add}, ${port}, username=${id}, ws=true, ws-path=${path}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, vmess-aead=true, skip-cert-verify=false, tfo=true
-EOF
+        appendSurgeProxy "${email} = vmess, ${add}, ${port}, username=${id}, ws=true, ws-path=${path}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, vmess-aead=true, skip-cert-verify=false" || return 1
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vmess\",\"server\":\"${add}\",\"server_port\":${port},\"uuid\":\"${id}\",\"alter_id\":0,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"packet_encoding\":\"packetaddr\",\"transport\":{\"type\":\"ws\",\"path\":\"${path}\",\"max_early_data\":2048,\"early_data_header_name\":\"Sec-WebSocket-Protocol\"}}]" "${outputRoot}/sing-box/${user}") || return 1
 
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vmess://${qrCodeBase64Default}\n"
+        printTerminalQRCode "QR code vmess(VMess+WS+TLS)" "vmess://${qrCodeBase64Default}"
 
     elif [[ "${type}" == "vlessws" ]]; then
-
+        local vlessWsURI="vless://${id}@${add}:${port}?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&fp=chrome&path=${path}#${email}"
         echoContent yellow " ---> Universal format (VLESS+WS+TLS)"
-        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&fp=chrome&path=${path}#${email}\n"
+        echoContent green "    ${vlessWsURI}\n"
 
         echoContent yellow " ---> Formatted plain text (VLESS+WS+TLS)"
         echoContent green " Protocol :VLESS, Address :${add}, Server name /SNI:${currentHost}, Port :${port}, client-fingerprint: chrome, User ID:${id}, Security :tls, Transport :ws, Path :${path}, Account :${email}\n"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@${add}:${port}?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&fp=chrome&path=${path}#${email}
-EOF
+        printf '%s\n' "${vlessWsURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vless
@@ -5941,26 +6208,25 @@ EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"${add}\",\"server_port\":${port},\"uuid\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"multiplex\":{\"enabled\":false,\"protocol\":\"smux\",\"max_streams\":32},\"packet_encoding\":\"xudp\",\"transport\":{\"type\":\"ws\",\"path\":\"${path}\",\"headers\":{\"Host\":\"${currentHost}\"}}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code VLESS(VLESS+WS+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dws%26host%3D${currentHost}%26fp%3Dchrome%26sni%3D${currentHost}%26path%3D${path}%23${email}"
+        printTerminalQRCode "QR code VLESS(VLESS+WS+TLS)" "${vlessWsURI}"
 
-        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, ws=true, ws-path=/${path#/}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, ws=true, ws-path=/${path#/}, ws-headers=Host:${currentHost}, tls=true, sni=${currentHost}, skip-cert-verify=false" || return 1
 
     elif [[ "${type}" == "vlessXHTTP" ]]; then
-
+        local shortId="${xrayVLESSRealityXHTTPShortId:-$(tr -d '\r\n' </etc/v2ray-agent/reality_shortid 2>/dev/null)}"
+        [[ -n "${shortId}" ]] || shortId="6ba85179e30d4fc2"
         local xhttpMldsa65Param=
         if [[ "${coreInstallType}" == "1" && -n "${currentRealityMldsa65Verify}" && "${currentRealityMldsa65Verify}" != "null" ]]; then
             xhttpMldsa65Param="&pqv=${currentRealityMldsa65Verify}"
         fi
+        local vlessXhttpURI="vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=${shortId}#${email}"
 
         echoContent yellow " ---> Generic format (VLESS+reality+XHTTP)"
-        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&host=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}\n"
+        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&host=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=${shortId}#${email}\n"
 
         echoContent yellow " ---> Formatted details (VLESS+reality+XHTTP)"
-        echoContent green " Protocol :VLESS reality, Address :${add}, publicKey:${currentRealityXHTTPPublicKey}, shortId: 6ba85179e30d4fc2,serverNames: ${xrayVLESSRealityXHTTPServerName}, Port :${port}, Path : ${path}, SNI:${xrayVLESSRealityXHTTPServerName}, Server name :${xrayVLESSRealityXHTTPServerName}, User ID:${id}, Transport :xhttp, Account :${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}
-EOF
+        echoContent green " Protocol :VLESS reality, Address :${add}, publicKey:${currentRealityXHTTPPublicKey}, shortId: ${shortId},serverNames: ${xrayVLESSRealityXHTTPServerName}, Port :${port}, Path : ${path}, SNI:${xrayVLESSRealityXHTTPServerName}, Server name :${xrayVLESSRealityXHTTPServerName}, User ID:${id}, Transport :xhttp, Account :${email}\n"
+        printf '%s\n' "${vlessXhttpURI}" >>"${outputRoot}/default/${user}" || return 1
 
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
@@ -5980,28 +6246,23 @@ EOF
       host: ${xrayVLESSRealityXHTTPServerName}
     reality-opts:
       public-key: ${currentRealityXHTTPPublicKey}
-      short-id: 6ba85179e30d4fc2
+      short-id: ${shortId}
       support-x25519mlkem768: true
 EOF
 
-        echoContent yellow " ---> QR code VLESS(VLESS+WS+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
-
-        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, sni=${xrayVLESSRealityXHTTPServerName}, reality-public-key=${currentRealityXHTTPPublicKey}, reality-short-id=6ba85179e30d4fc2, xhttp=true, xhttp-path=/${path#/}, xhttp-host=${xrayVLESSRealityXHTTPServerName}, tfo=true" || return 1
+        printTerminalQRCode "QR code VLESS(VLESS+reality+XHTTP)" "${vlessXhttpURI}"
 
     elif
         [[ "${type}" == "vlessgrpc" ]]
     then
-
+        local vlessGrpcURI="vless://${id}@${add}:${port}?encryption=none&security=tls&type=grpc&host=${currentHost}&path=${currentPath}grpc&serviceName=${currentPath}grpc&fp=chrome&alpn=h2&sni=${currentHost}#${email}"
         echoContent yellow " ---> Universal format (VLESS+gRPC+TLS)"
-        echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=tls&type=grpc&host=${currentHost}&path=${currentPath}grpc&fp=chrome&serviceName=${currentPath}grpc&alpn=h2&sni=${currentHost}#${email}\n"
+        echoContent green "    ${vlessGrpcURI}\n"
 
         echoContent yellow " ---> Formatted plain text (VLESS+gRPC+TLS)"
         echoContent green " Protocol :VLESS, Address :${add}, Server name /SNI:${currentHost}, Port :${port}, User ID:${id}, Security :tls, Transport :gRPC, alpn:h2, client-fingerprint: chrome,serviceName:${currentPath}grpc, Account :${email}\n"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@${add}:${port}?encryption=none&security=tls&type=grpc&host=${currentHost}&path=${currentPath}grpc&serviceName=${currentPath}grpc&fp=chrome&alpn=h2&sni=${currentHost}#${email}
-EOF
+        printf '%s\n' "${vlessGrpcURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vless
@@ -6020,19 +6281,16 @@ EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\": \"vless\",\"server\": \"${add}\",\"server_port\": ${port},\"uuid\": \"${id}\",\"tls\": {  \"enabled\": true,  \"server_name\": \"${currentHost}\",  \"utls\": {    \"enabled\": true,    \"fingerprint\": \"chrome\"  }},\"packet_encoding\": \"xudp\",\"transport\": {  \"type\": \"grpc\",  \"service_name\": \"${currentPath}grpc\"}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code VLESS(VLESS+gRPC+TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dtls%26type%3Dgrpc%26host%3D${currentHost}%26serviceName%3D${currentPath}grpc%26fp%3Dchrome%26path%3D${currentPath}grpc%26sni%3D${currentHost}%26alpn%3Dh2%23${email}"
+        printTerminalQRCode "QR code VLESS(VLESS+gRPC+TLS)" "${vlessGrpcURI}"
 
-        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, grpc=true, grpc-service-name=${currentPath}grpc, tls=true, sni=${currentHost}, skip-cert-verify=false, tfo=true" || return 1
+        appendSurgeProxy "${email} = vless, ${add}, ${port}, username=${id}, grpc=true, grpc-service-name=${currentPath}grpc, tls=true, sni=${currentHost}, skip-cert-verify=false" || return 1
 
     elif [[ "${type}" == "trojan" ]]; then
-        # URLEncode
+        local trojanURI="trojan://${id}@${currentHost}:${port}?peer=${currentHost}&fp=chrome&sni=${currentHost}&alpn=http/1.1#${email}_Trojan"
         echoContent yellow " ---> Trojan(TLS)"
-        echoContent green "    trojan://${id}@${currentHost}:${port}?peer=${currentHost}&fp=chrome&sni=${currentHost}&alpn=http/1.1#${currentHost}_Trojan\n"
+        echoContent green "    ${trojanURI}\n"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-trojan://${id}@${currentHost}:${port}?peer=${currentHost}&fp=chrome&sni=${currentHost}&alpn=http/1.1#${email}_Trojan
-EOF
+        printf '%s\n' "${trojanURI}" >>"${outputRoot}/default/${user}" || return 1
 
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
@@ -6044,24 +6302,17 @@ EOF
     udp: true
     sni: ${currentHost}
 EOF
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = trojan, ${currentHost}, ${port}, password=${id}, sni=${currentHost}, skip-cert-verify=false, tfo=true
-EOF
+        appendSurgeProxy "${email} = trojan, ${currentHost}, ${port}, password=${id}, sni=${currentHost}, skip-cert-verify=false" || return 1
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"trojan\",\"server\":\"${currentHost}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"alpn\":[\"http/1.1\"],\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code Trojan(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=trojan%3a%2f%2f${id}%40${currentHost}%3a${port}%3fpeer%3d${currentHost}%26fp%3Dchrome%26sni%3d${currentHost}%26alpn%3Dhttp/1.1%23${email}\n"
+        printTerminalQRCode "QR code Trojan(TLS)" "${trojanURI}"
 
     elif [[ "${type}" == "trojangrpc" ]]; then
-        # URLEncode
-
+        local trojanGrpcURI="trojan://${id}@${add}:${port}?encryption=none&peer=${currentHost}&security=tls&type=grpc&fp=chrome&sni=${currentHost}&alpn=h2&path=${currentPath}trojangrpc&serviceName=${currentPath}trojangrpc#${email}"
         echoContent yellow " ---> Trojan gRPC(TLS)"
-        echoContent green "    trojan://${id}@${add}:${port}?encryption=none&peer=${currentHost}&fp=chrome&security=tls&type=grpc&sni=${currentHost}&alpn=h2&path=${currentPath}trojangrpc&serviceName=${currentPath}trojangrpc#${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-trojan://${id}@${add}:${port}?encryption=none&peer=${currentHost}&security=tls&type=grpc&fp=chrome&sni=${currentHost}&alpn=h2&path=${currentPath}trojangrpc&serviceName=${currentPath}trojangrpc#${email}
-EOF
+        echoContent green "    ${trojanGrpcURI}\n"
+        printf '%s\n' "${trojanGrpcURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     server: ${add}
@@ -6078,33 +6329,34 @@ EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"trojan\",\"server\":\"${add}\",\"server_port\":${port},\"password\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"insecure\":true,\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"transport\":{\"type\":\"grpc\",\"service_name\":\"${currentPath}trojangrpc\",\"idle_timeout\":\"15s\",\"ping_timeout\":\"15s\",\"permit_without_stream\":false},\"multiplex\":{\"enabled\":false,\"protocol\":\"smux\",\"max_streams\":32}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code Trojan gRPC(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=trojan%3a%2f%2f${id}%40${add}%3a${port}%3Fencryption%3Dnone%26fp%3Dchrome%26security%3Dtls%26peer%3d${currentHost}%26type%3Dgrpc%26sni%3d${currentHost}%26path%3D${currentPath}trojangrpc%26alpn%3Dh2%26serviceName%3D${currentPath}trojangrpc%23${email}\n"
+        printTerminalQRCode "QR code Trojan gRPC(TLS)" "${trojanGrpcURI}"
 
     elif [[ "${type}" == "hysteria" ]]; then
         echoContent yellow " ---> Hysteria(TLS)"
         local clashMetaPortContent="port: ${port}"
         local multiPort=
-        local multiPortEncode
-        local speedParams= speedParamsEncode=
-        # Skip speed params when the server ignores client bandwidth (null); clients use BBR
-        if [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ && "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        local speedParams=
+        local hysteria2UriPort="${hysteriaPort:-${port%%-*}}"
+        # Skip bandwidth params when 0/null so client uses BBR
+        if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
             speedParams="upmbps=${hysteria2ClientUploadSpeed}&downmbps=${hysteria2ClientDownloadSpeed}&"
-            speedParamsEncode="upmbps%3D${hysteria2ClientUploadSpeed}%26downmbps%3D${hysteria2ClientDownloadSpeed}%26"
         fi
         if echo "${port}" | grep -q "-"; then
             clashMetaPortContent="ports: \"${port}\"
     hop-interval: ${hysteria2HopInterval:-60}"
             multiPort="mport=${port}&"
-            multiPortEncode="mport%3D${port}%26"
+        fi
+        if echo "${port}" | grep -q "-"; then
+            clashMetaPortContent="ports: \"${port}\"
+    hop-interval: ${hysteria2HopInterval:-60}"
+            multiPort="mport=${port}&"
         fi
 
-        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}${speedParams}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-hysteria2://${id}@${currentHost}:${port}?${multiPort}${speedParams}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
-EOF
+        local hysteria2URI="hysteria2://${id}@${currentHost}:${hysteria2UriPort}?${multiPort}${speedParams}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}"
+        echoContent green "    ${hysteria2URI}\n"
+        printf '%s\n' "${hysteria2URI}" >>"${outputRoot}/default/${user}" || return 1
         echoContent yellow " ---> v2rayN(hysteria+TLS)"
-        jq -n --arg server "${currentHost}:${port}" --arg password "${id}" --arg host "${currentHost}" \
+        jq -n --arg server "${currentHost}:${hysteria2UriPort}" --arg password "${id}" --arg host "${currentHost}" \
             --arg port "${port}" --arg interval "${hysteria2HopInterval:-60}s" \
             '{server:$server,socks5:{listen:"127.0.0.1:7798",timeout:300},auth:$password,tls:{sni:$host}} +
             (if $port | contains("-") then {transport:{udp:{hopInterval:$interval}}} else {} end)'
@@ -6118,38 +6370,38 @@ EOF
     alpn:
         - h3
     sni: ${currentHost}
+EOF
+        if isPositiveNumber "${hysteria2ClientUploadSpeed}" && isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
+            cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
     up: "${hysteria2ClientUploadSpeed} Mbps"
     down: "${hysteria2ClientDownloadSpeed} Mbps"
 EOF
-        local surgeHysteria2Port="${port%%-*}"
+        fi
+        local surgeHysteria2Port="${hysteriaPort:-${port%%-*}}"
         local surgePortHopping=
         local surgeBandwidth=
         if echo "${port}" | grep -q "-"; then
             # Surge port-hopping separates ports or ranges with semicolons. A range keeps its hyphen, for example 30000-31000
             surgePortHopping=", port-hopping=${port}, port-hopping-interval=${hysteria2HopInterval:-60}"
         fi
-        # With ignore_client_bandwidth the server has no up_mbps and jq returns null. Surge rejects a null bandwidth
-        if [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+$ ]]; then
+        if isPositiveNumber "${hysteria2ClientDownloadSpeed}"; then
             surgeBandwidth=", download-bandwidth=${hysteria2ClientDownloadSpeed}"
         fi
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = hysteria2, ${currentHost}, ${surgeHysteria2Port}, password=${id}, sni=${currentHost}${surgeBandwidth}, skip-cert-verify=false, tfo=true${surgePortHopping}
-EOF
+        appendSurgeProxy "${email} = hysteria2, ${currentHost}, ${surgeHysteria2Port}, password=${id}, sni=${currentHost}${surgeBandwidth}, skip-cert-verify=false${surgePortHopping}" || return 1
 
         local hysteria2Node
         hysteria2Node=$(buildSingBoxHysteria2Node "${port}" "${email}" "${id}") || return 1
         singBoxSubscribeLocalConfig=$(jq --argjson node "${hysteria2Node}" '. += [$node]' "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code Hysteria(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}${speedParamsEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
+        printTerminalQRCode "QR code Hysteria2(TLS)" "${hysteria2URI}"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
         local publicKey=${currentRealityPublicKey}
         local realityMldsa65Verify=${currentRealityMldsa65Verify}
         local realityMldsa65Param=
+        local shortId="${xrayVLESSRealityShortId}"
         if [[ "${coreInstallType}" == "1" && -n "${realityMldsa65Verify}" && "${realityMldsa65Verify}" != "null" ]]; then
             realityMldsa65Param="&pqv=${realityMldsa65Verify}"
         fi
@@ -6157,19 +6409,24 @@ EOF
         if [[ "${coreInstallType}" == "2" ]]; then
             realityServerName=${singBoxVLESSRealityVisionServerName}
             publicKey=${singBoxVLESSRealityPublicKey}
+            shortId="${singBoxVLESSRealityVisionShortId}"
         fi
+        [[ -n "${shortId}" ]] || shortId=$(tr -d '\r\n' </etc/v2ray-agent/reality_shortid 2>/dev/null)
+        [[ -n "${shortId}" ]] || shortId="6ba85179e30d4fc2"
+        local serverAddr
+        serverAddr=$(getPublicIP)
+        local vlessRealityURI="vless://${id}@${serverAddr}:${port}?encryption=none&security=reality${realityMldsa65Param}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=${shortId}&flow=xtls-rprx-vision#${email}"
+
         echoContent yellow " ---> Universal format (VLESS+reality+uTLS+Vision)"
-        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}\n"
+        echoContent green "    ${vlessRealityURI}\n"
 
         echoContent yellow " ---> Formatted plain text (VLESS+reality+uTLS+Vision)"
-        echoContent green " Protocol :VLESS reality, Address :$(getPublicIP), publicKey:${publicKey}, shortId: 6ba85179e30d4fc2${realityMldsa65Param:+, pqv=${realityMldsa65Verify}}, serverNames: ${realityServerName}, Port :${port}, User ID:${id}, Transport :tcp, Account :${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}
-EOF
+        echoContent green " Protocol :VLESS reality, Address :${serverAddr}, publicKey:${publicKey}, shortId: ${shortId}${realityMldsa65Param:+, pqv=${realityMldsa65Verify}}, serverNames: ${realityServerName}, Port :${port}, User ID:${id}, Transport :tcp, Account :${email}\n"
+        printf '%s\n' "${vlessRealityURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vless
-    server: $(getPublicIP)
+    server: ${serverAddr}
     port: ${port}
     uuid: ${id}
     network: tcp
@@ -6180,24 +6437,24 @@ EOF
     servername: ${realityServerName}
     reality-opts:
       public-key: ${publicKey}
-      short-id: 6ba85179e30d4fc2
+      short-id: ${shortId}
       support-x25519mlkem768: true
     client-fingerprint: chrome
 EOF
 
-        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"$(getPublicIP)\",\"server_port\":${port},\"uuid\":\"${id}\",\"flow\":\"xtls-rprx-vision\",\"tls\":{\"enabled\":true,\"server_name\":\"${realityServerName}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"},\"reality\":{\"enabled\":true,\"public_key\":\"${publicKey}\",\"short_id\":\"6ba85179e30d4fc2\"}},\"packet_encoding\":\"xudp\"}]" "${outputRoot}/sing-box/${user}") || return 1
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"${serverAddr}\",\"server_port\":${port},\"uuid\":\"${id}\",\"flow\":\"xtls-rprx-vision\",\"tls\":{\"enabled\":true,\"server_name\":\"${realityServerName}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"},\"reality\":{\"enabled\":true,\"public_key\":\"${publicKey}\",\"short_id\":\"${shortId}\"}},\"packet_encoding\":\"xudp\"}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code VLESS(VLESS+reality+uTLS+Vision)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dtcp%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26flow%3Dxtls-rprx-vision%23${email}\n"
+        printTerminalQRCode "QR code VLESS(VLESS+reality+uTLS+Vision)" "${vlessRealityURI}"
 
-        appendSurgeProxy "${email} = vless, $(getPublicIP), ${port}, username=${id}, flow=xtls-rprx-vision, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=6ba85179e30d4fc2, tfo=true" || return 1
+        appendSurgeProxy "${email} = vless, ${serverAddr}, ${port}, username=${id}, flow=xtls-rprx-vision, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=${shortId}" || return 1
 
     elif [[ "${type}" == "vlessRealityGRPC" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
         local publicKey=${currentRealityPublicKey}
         local realityMldsa65Verify=${currentRealityMldsa65Verify}
         local realityMldsa65Param=
+        local shortId="${xrayVLESSRealityShortId}"
         if [[ "${coreInstallType}" == "1" && -n "${realityMldsa65Verify}" && "${realityMldsa65Verify}" != "null" ]]; then
             realityMldsa65Param="&pqv=${realityMldsa65Verify}"
         fi
@@ -6205,20 +6462,24 @@ EOF
         if [[ "${coreInstallType}" == "2" ]]; then
             realityServerName=${singBoxVLESSRealityGRPCServerName}
             publicKey=${singBoxVLESSRealityPublicKey}
+            shortId="${singBoxVLESSRealityGRPCShortId}"
         fi
+        [[ -n "${shortId}" ]] || shortId=$(tr -d '\r\n' </etc/v2ray-agent/reality_shortid 2>/dev/null)
+        [[ -n "${shortId}" ]] || shortId="6ba85179e30d4fc2"
+        local serverAddr
+        serverAddr=$(getPublicIP)
+        local vlessRealityGrpcURI="vless://${id}@${serverAddr}:${port}?encryption=none&security=reality${realityMldsa65Param}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=${shortId}&path=grpc&serviceName=grpc#${email}"
 
         echoContent yellow " ---> Universal format (VLESS+reality+uTLS+gRPC)"
-        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}\n"
+        echoContent green "    ${vlessRealityGrpcURI}\n"
 
         echoContent yellow " ---> Formatted plain text (VLESS+reality+uTLS+gRPC)"
-        echoContent green " Protocol :VLESS reality, serviceName:grpc, Address :$(getPublicIP), publicKey:${publicKey}, shortId: 6ba85179e30d4fc2${realityMldsa65Param:+, pqv=${realityMldsa65Verify}}, serverNames: ${realityServerName}, Port :${port}, User ID:${id}, Transport :gRPC, client-fingerprint: chrome, Account :${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}
-EOF
+        echoContent green " Protocol :VLESS reality, serviceName:grpc, Address :${serverAddr}, publicKey:${publicKey}, shortId: ${shortId}${realityMldsa65Param:+, pqv=${realityMldsa65Verify}}, serverNames: ${realityServerName}, Port :${port}, User ID:${id}, Transport :gRPC, client-fingerprint: chrome, Account :${email}\n"
+        printf '%s\n' "${vlessRealityGrpcURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vless
-    server: $(getPublicIP)
+    server: ${serverAddr}
     port: ${port}
     uuid: ${id}
     network: grpc
@@ -6227,19 +6488,18 @@ EOF
     servername: ${realityServerName}
     reality-opts:
       public-key: ${publicKey}
-      short-id: 6ba85179e30d4fc2
+      short-id: ${shortId}
       support-x25519mlkem768: true
     grpc-opts:
       grpc-service-name: "grpc"
     client-fingerprint: chrome
 EOF
 
-        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"$(getPublicIP)\",\"server_port\":${port},\"uuid\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${realityServerName}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"},\"reality\":{\"enabled\":true,\"public_key\":\"${publicKey}\",\"short_id\":\"6ba85179e30d4fc2\"}},\"packet_encoding\":\"xudp\",\"transport\":{\"type\":\"grpc\",\"service_name\":\"grpc\"}}]" "${outputRoot}/sing-box/${user}") || return 1
+        singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vless\",\"server\":\"${serverAddr}\",\"server_port\":${port},\"uuid\":\"${id}\",\"tls\":{\"enabled\":true,\"server_name\":\"${realityServerName}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"},\"reality\":{\"enabled\":true,\"public_key\":\"${publicKey}\",\"short_id\":\"${shortId}\"}},\"packet_encoding\":\"xudp\",\"transport\":{\"type\":\"grpc\",\"service_name\":\"grpc\"}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code VLESS(VLESS+reality+uTLS+gRPC)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40$(getPublicIP)%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dgrpc%26sni%3D${realityServerName}%26fp%3Dchrome%26pbk%3D${publicKey}%26sid%3D6ba85179e30d4fc2%26path%3Dgrpc%26serviceName%3Dgrpc%23${email}\n"
-        appendSurgeProxy "${email} = vless, $(getPublicIP), ${port}, username=${id}, grpc=true, grpc-service-name=grpc, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=6ba85179e30d4fc2, tfo=true" || return 1
+        printTerminalQRCode "QR code VLESS(VLESS+reality+uTLS+gRPC)" "${vlessRealityGrpcURI}"
+        appendSurgeProxy "${email} = vless, ${serverAddr}, ${port}, username=${id}, grpc=true, grpc-service-name=grpc, sni=${realityServerName}, reality-public-key=${publicKey}, reality-short-id=${shortId}" || return 1
     elif [[ "${type}" == "tuic" ]]; then
         local tuicUUID=
         tuicUUID=$(echo "${id}" | awk -F "[_]" '{print $1}')
@@ -6252,12 +6512,11 @@ EOF
             return 1
         fi
 
+        local tuicURI="tuic://${tuicUUID}:${tuicPassword}@${currentHost}:${port}?congestion_control=${tuicAlgorithm}&alpn=h3&sni=${currentHost}&udp_relay_mode=quic&allow_insecure=0#${email}"
         echoContent yellow " ---> Formatted plain text (Tuic+TLS)"
         echoContent green " Protocol :Tuic, Address :${currentHost}, Port : ${port}, uuid: ${tuicUUID}, password: ${tuicPassword}, congestion-controller:${tuicAlgorithm}, alpn: h3, Account :${email}\n"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-tuic://${tuicUUID}:${tuicPassword}@${currentHost}:${port}?congestion_control=${tuicAlgorithm}&alpn=h3&sni=${currentHost}&udp_relay_mode=quic&allow_insecure=0#${email}
-EOF
+        printf '%s\n' "${tuicURI}" >>"${outputRoot}/default/${user}" || return 1
         echoContent yellow " ---> v2rayN(Tuic+TLS)"
         echo "{\"relay\": {\"server\": \"${currentHost}:${port}\",\"uuid\": \"${tuicUUID}\",\"password\": \"${tuicPassword}\",\"ip\": \"${currentHost}\",\"congestion_control\": \"${tuicAlgorithm}\",\"alpn\": [\"h3\"]},\"local\": {\"server\": \"127.0.0.1:7798\"},\"log_level\": \"warn\"}" | jq
 
@@ -6269,31 +6528,25 @@ EOF
     uuid: ${tuicUUID}
     password: ${tuicPassword}
     alpn:
-     - h3
+      - h3
     congestion-controller: ${tuicAlgorithm}
     disable-sni: true
     reduce-rtt: true
-    sni: ${email}
+    sni: ${currentHost}
 EOF
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = tuic-v5, ${currentHost}, ${port}, uuid=${tuicUUID}, password=${tuicPassword}, alpn=h3, sni=${currentHost}, skip-cert-verify=false, tfo=true
-EOF
+        appendSurgeProxy "${email} = tuic-v5, ${currentHost}, ${port}, uuid=${tuicUUID}, password=${tuicPassword}, alpn=h3, sni=${currentHost}, skip-cert-verify=false" || return 1
 
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\": \"tuic\",\"server\": \"${currentHost}\",\"server_port\": ${port},\"uuid\": \"${tuicUUID}\",\"password\": \"${tuicPassword}\",\"congestion_control\": \"${tuicAlgorithm}\",\"tls\": {\"enabled\": true,\"server_name\": \"${currentHost}\",\"alpn\": [\"h3\"]}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow "\n ---> QR code Tuic"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=tuic%3A%2F%2F${tuicUUID}%3A${tuicPassword}%40${currentHost}%3A${tuicPort}%3Fcongestion_control%3D${tuicAlgorithm}%26alpn%3Dh3%26sni%3D${currentHost}%26udp_relay_mode%3Dquic%26allow_insecure%3D0%23${email}\n"
+        printTerminalQRCode "QR code Tuic" "${tuicURI}"
     elif [[ "${type}" == "naive" ]]; then
+        local naiveURI="naive+https://${email}:${id}@${currentHost}:${port}?padding=true#${email}"
         echoContent yellow " ---> Naive(TLS)"
 
-        echoContent green "    naive+https://${email}:${id}@${currentHost}:${port}?padding=true#${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-naive+https://${email}:${id}@${currentHost}:${port}?padding=true#${email}
-EOF
-        echoContent yellow " ---> QR code Naive(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=naive%2Bhttps%3A%2F%2F${email}%3A${id}%40${currentHost}%3A${port}%3Fpadding%3Dtrue%23${email}\n"
+        echoContent green "    ${naiveURI}\n"
+        printf '%s\n' "${naiveURI}" >>"${outputRoot}/default/${user}" || return 1
+        printTerminalQRCode "QR code Naive(TLS)" "${naiveURI}"
     elif [[ "${type}" == "vmessHTTPUpgrade" ]]; then
         qrCodeBase64Default=$(echo -n "{\"port\":${port},\"ps\":\"${email}\",\"tls\":\"tls\",\"id\":\"${id}\",\"aid\":0,\"v\":2,\"host\":\"${currentHost}\",\"type\":\"none\",\"path\":\"${path}\",\"net\":\"httpupgrade\",\"add\":\"${add}\",\"method\":\"none\",\"peer\":\"${currentHost}\",\"sni\":\"${currentHost}\"}" | base64 -w 0) || return 1
         qrCodeBase64Default="${qrCodeBase64Default// /}"
@@ -6302,11 +6555,8 @@ EOF
         echoContent green "    {\"port\":${port},\"ps\":\"${email}\",\"tls\":\"tls\",\"id\":\"${id}\",\"aid\":0,\"v\":2,\"host\":\"${currentHost}\",\"type\":\"none\",\"path\":\"${path}\",\"net\":\"httpupgrade\",\"add\":\"${add}\",\"method\":\"none\",\"peer\":\"${currentHost}\",\"sni\":\"${currentHost}\"}\n"
         echoContent yellow " ---> Generic vmess(VMess+HTTPUpgrade+TLS) link "
         echoContent green "    vmess://${qrCodeBase64Default}\n"
-        echoContent yellow " ---> QR code vmess(VMess+HTTPUpgrade+TLS)"
 
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-   vmess://${qrCodeBase64Default}
-EOF
+        printf 'vmess://%s\n' "${qrCodeBase64Default}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: vmess
@@ -6321,27 +6571,26 @@ EOF
     servername: ${currentHost}
     network: ws
     ws-opts:
-     path: ${path}
-     headers:
-       Host: ${currentHost}
-     v2ray-http-upgrade: true
+      path: ${path}
+      headers:
+        Host: ${currentHost}
+      v2ray-http-upgrade: true
 EOF
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"vmess\",\"server\":\"${add}\",\"server_port\":${port},\"uuid\":\"${id}\",\"security\":\"auto\",\"alter_id\":0,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\",\"utls\":{\"enabled\":true,\"fingerprint\":\"chrome\"}},\"packet_encoding\":\"packetaddr\",\"transport\":{\"type\":\"httpupgrade\",\"path\":\"${path}\"}}]" "${outputRoot}/sing-box/${user}") || return 1
 
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vmess://${qrCodeBase64Default}\n"
+        printTerminalQRCode "QR code vmess(VMess+HTTPUpgrade+TLS)" "vmess://${qrCodeBase64Default}"
 
     elif [[ "${type}" == "anytls" ]]; then
+        local anytlsURI="anytls://${id}@${currentHost}:${singBoxAnyTLSPort}?peer=${currentHost}&insecure=0&sni=${currentHost}#${email}"
         echoContent yellow " ---> AnyTLS"
 
         echoContent yellow " ---> Formatted details (AnyTLS)"
         echoContent green " Protocol :anytls, Address :${currentHost}, Port :${singBoxAnyTLSPort}, User ID:${id}, Transport :tcp, Account :${email}\n"
 
-        echoContent green "    anytls://${id}@${currentHost}:${singBoxAnyTLSPort}?peer=${currentHost}&insecure=0&sni=${currentHost}#${email}\n"
-        cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-anytls://${id}@${currentHost}:${singBoxAnyTLSPort}?peer=${currentHost}&insecure=0&sni=${currentHost}#${email}
-EOF
+        echoContent green "    ${anytlsURI}\n"
+        printf '%s\n' "${anytlsURI}" >>"${outputRoot}/default/${user}" || return 1
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
     type: anytls
@@ -6358,16 +6607,12 @@ EOF
     idle-session-timeout: 30
     min-idle-session: 2
 EOF
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = anytls, ${currentHost}, ${singBoxAnyTLSPort}, password=${id}, sni=${currentHost}, skip-cert-verify=false
-EOF
+        appendSurgeProxy "${email} = anytls, ${currentHost}, ${singBoxAnyTLSPort}, password=${id}, sni=${currentHost}, skip-cert-verify=false" || return 1
 
         singBoxSubscribeLocalConfig=$(jq -r ". += [{\"tag\":\"${email}\",\"type\":\"anytls\",\"server\":\"${currentHost}\",\"server_port\":${singBoxAnyTLSPort},\"password\":\"${id}\",\"idle_session_check_interval\":\"30s\",\"idle_session_timeout\":\"30s\",\"min_idle_session\":2,\"tls\":{\"enabled\":true,\"server_name\":\"${currentHost}\"}}]" "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
-        echoContent yellow " ---> QR code AnyTLS"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=anytls%3A%2F%2F${id}%40${currentHost}%3A${singBoxAnyTLSPort}%3Fpeer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%23${email}\n"
+        printTerminalQRCode "QR code AnyTLS" "${anytlsURI}"
 
     elif [[ "${type}" == "snell" ]]; then
         echoContent yellow " ---> Snell"
@@ -6383,18 +6628,13 @@ EOF
         if [[ ! -f "${outputRoot}/default/${user}" ]]; then
             : >"${outputRoot}/default/${user}" || return 1
         fi
-        mkdir -p "${outputRoot}/surge" || return 1
-        cat <<EOF >>"${outputRoot}/surge/${user}" || return 1
-${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true
-EOF
+        local snellSurgeLine="${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6"
+        appendSurgeProxy "${snellSurgeLine}" || return 1
 
         # sing-box 1.14+ supports Snell v6 outbounds. Clash Verge Rev reports an error on the Snell node, so it is left out of the clashMeta subscription for now
         singBoxSubscribeLocalConfig=$(jq --arg tag "${email}" --arg server "${snellHost}" --argjson port "${port}" --arg psk "${id}" \
             '. += [{tag:$tag,type:"snell",server:$server,server_port:$port,version:6,psk:$psk,mode:"default"}]' "${outputRoot}/sing-box/${user}") || return 1
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
-
-        echoContent yellow " ---> Surge"
-        echoContent green "    ${email} = snell, ${snellHost}, ${port}, psk=${id}, version=6, tfo=true\n"
     fi
 
 }
@@ -6871,18 +7111,20 @@ showAccounts() {
 }
 # Remove nginx302 configuration
 removeNginx302() {
+    local aloneConf="${nginxConfigPath}alone.conf"
+    [[ -f "${aloneConf}" ]] || return 0
     local line
-    local count=
+    local count=0
     while IFS= read -r line; do
 
         if ! echo "${line}" | grep -q "request_uri"; then
             local removeIndex=
             removeIndex=$(echo "${line}" | awk -F "[:]" '{print $1}')
             removeIndex=$((removeIndex + count))
-            sed -i "${removeIndex}d" "${nginxConfigPath}alone.conf"
+            sed -i "${removeIndex}d" "${aloneConf}"
             count=$((count - 1))
         fi
-    done < <(grep -n "return 302" <"${nginxConfigPath}alone.conf")
+    done < <(grep -n "return 302" <"${aloneConf}")
 }
 
 # Check if 302 is successful
@@ -6890,12 +7132,8 @@ checkNginx302() {
     local domain302Status=
     domain302Status=$(curl -s "https://${currentHost}:${currentPort}")
     if echo "${domain302Status}" | grep -q "302"; then
-        #        local domain302Result=
-        #        domain302Result=$(curl -L -s "https://${currentHost}:${currentPort}")
-        #        if [[ -n "${domain302Result}" ]]; then
         echoContent green " ---> 302 redirection set up successfully"
         exit 0
-        #        fi
     fi
     echoContent red " ---> 302 redirection setting failed, please double check whether it is the same as the example"
     backupNginxConfig restoreBackup
@@ -6904,20 +7142,25 @@ checkNginx302() {
 # Backup and restore nginx files
 backupNginxConfig() {
     if [[ "$1" == "backup" ]]; then
-        cp ${nginxConfigPath}alone.conf /etc/v2ray-agent/alone_backup.conf
+        [[ -f "${nginxConfigPath}alone.conf" ]] || return 1
+        cp "${nginxConfigPath}alone.conf" /etc/v2ray-agent/alone_backup.conf
         echoContent green " ---> nginx configuration file backup successful"
     fi
 
     if [[ "$1" == "restoreBackup" ]] && [[ -f "/etc/v2ray-agent/alone_backup.conf" ]]; then
-        cp /etc/v2ray-agent/alone_backup.conf ${nginxConfigPath}alone.conf
+        cp /etc/v2ray-agent/alone_backup.conf "${nginxConfigPath}alone.conf"
         echoContent green " ---> nginx configuration file restoration backup successful"
-        rm /etc/v2ray-agent/alone_backup.conf
+        rm -f /etc/v2ray-agent/alone_backup.conf
     fi
 
 }
 # Add 302 configuration
 addNginx302() {
-
+    local aloneConf="${nginxConfigPath}alone.conf"
+    [[ -f "${aloneConf}" ]] || {
+        echoContent red " ---> alone.conf not found, 302 add failed"
+        return 1
+    }
     local line
     local count=1
     while IFS= read -r line; do
@@ -6925,27 +7168,26 @@ addNginx302() {
             local insertIndex=
             insertIndex="$(echo "${line}" | awk -F "[:]" '{print $1}')"
             insertIndex=$((insertIndex + count))
-            sed "${insertIndex}i return 302 '$1';" "${nginxConfigPath}alone.conf" >"${nginxConfigPath}tmpfile" && mv "${nginxConfigPath}tmpfile" "${nginxConfigPath}alone.conf"
+            sed "${insertIndex}i return 302 '$1';" "${aloneConf}" >"${nginxConfigPath}tmpfile" && mv "${nginxConfigPath}tmpfile" "${aloneConf}"
             count=$((count + 1))
         else
             echoContent red " ---> 302 Add failed"
             backupNginxConfig restoreBackup
         fi
 
-    done < <(grep -n "location / {" <"${nginxConfigPath}alone.conf")
+    done < <(grep -n "location / {" <"${aloneConf}")
 }
 
 # Update camouflage station
 updateNginxBlog() {
-    if [[ "${coreInstallType}" == "2" ]]; then
-        echoContent red "\n ---> This feature only supports Xray-core core "
-        exit 0
-    fi
-
     echoContent skyBlue "\nProgress$1/${totalProgress}: Change disguise site"
 
-    if ! echo "${currentInstallProtocolType}" | grep -q ",0," || [[ -z "${coreInstallType}" ]]; then
-        echoContent red "\n ---> Due to environmental dependencies, please install Xray-core's VLESS_TCP_TLS_Vision first"
+    if [[ -n "${btDomain}" ]]; then
+        echoContent red "\n ---> BT Panel / 1Panel detected; manage sites through the panel"
+        exit 0
+    fi
+    if [[ -z "${coreInstallType}" && ! -f "${nginxConfigPath}subscribe.conf" ]]; then
+        echoContent red "\n ---> Please install a service first before managing the camouflage site"
         exit 0
     fi
     echoContent red "=============================================================="
@@ -6959,13 +7201,13 @@ updateNginxBlog() {
     echoContent yellow "7.Enterprise Station 02"
     echoContent yellow "8.Personal blog 02"
     echoContent yellow "9.404 automatically jumps to baidu"
-    echoContent yellow "10.302 redirect website"
+    echoContent yellow "10.302 redirect website [Xray alone.conf only]"
     echoContent red "=============================================================="
     read -r -p "Please select:" selectInstallNginxBlogType
 
     if [[ "${selectInstallNginxBlogType}" == "10" ]]; then
-        if [[ "${coreInstallType}" == "2" ]]; then
-            echoContent red "\n ---> This feature only supports Xray-core core , Wait for a future update "
+        if [[ "${coreInstallType}" == "2" || ! -f "${nginxConfigPath}alone.conf" ]]; then
+            echoContent red "\n ---> 302 redirect is only supported when Xray alone.conf is active"
             exit 0
         fi
         echoContent red "\n=============================================================="
@@ -6977,10 +7219,10 @@ updateNginxBlog() {
         read -r -p "Please select:" redirectStatus
 
         if [[ "${redirectStatus}" == "1" ]]; then
-            backupNginxConfig backup
+            backupNginxConfig backup || exit 1
             read -r -p "Please enter the domain name to be redirected, for example https://www.baidu.com:" redirectDomain
             removeNginx302
-            addNginx302 "${redirectDomain}"
+            addNginx302 "${redirectDomain}" || exit 1
             handleNginx stop
             handleNginx start
             if ! isNginxRunning; then
@@ -7170,15 +7412,18 @@ unInstall() {
     removeCoreService sing-box || { echoContent red " ---> sing-box service cleanup failed; uninstall stopped"; return 1; }
 
     rm -rf /etc/v2ray-agent
-    rm -rf ${nginxConfigPath}alone.conf
-    rm -rf ${nginxConfigPath}checkPortOpen.conf >/dev/null 2>&1
+    rm -rf "${nginxConfigPath}alone.conf"
+    rm -rf "${nginxConfigPath}checkPortOpen.conf" >/dev/null 2>&1
+    rm -rf "${nginxConfigPath}sing_box_decoy.conf" >/dev/null 2>&1
+    rm -rf "${nginxConfigPath}sing_box_VLESS_WS.conf" >/dev/null 2>&1
+    rm -rf "${nginxConfigPath}sing_box_VMess_WS.conf" >/dev/null 2>&1
     rm -rf "${nginxConfigPath}sing_box_VMess_HTTPUpgrade.conf" >/dev/null 2>&1
-    rm -rf ${nginxConfigPath}checkPortOpen.conf >/dev/null 2>&1
 
     unInstallSubscribe
 
     if [[ -d "${nginxStaticPath}" && -f "${nginxStaticPath}/check" ]]; then
         rm -rf "${nginxStaticPath}"
+        removeNginxBlogIndexDivert
         echoContent green " ---> Deletion of fake website completed"
     fi
 
@@ -7260,6 +7505,9 @@ updateV2RayAgent() {
     if ! chmod 700 "${scriptTemp}" || ! mv -f "${scriptTemp}" /etc/v2ray-agent/install.sh; then
         rm -f "${scriptTemp}"
         return 1
+    fi
+    if [[ -z "${btDomain}" && -d "${nginxConfigPath}" ]] && command -v nginx >/dev/null 2>&1; then
+        ensureNginxBlog >/dev/null 2>&1 || true
     fi
     local version
     version=$(grep 'Current version: v' "/etc/v2ray-agent/install.sh" | awk -F "[v]" '{print $2}' | tail -n +2 | head -n 1 | awk -F "[\"]" '{print $1}')
@@ -7424,6 +7672,9 @@ aliasInstall() {
         fi
         if [[ "${vasmaType}" == "true" ]]; then
             echoContent green "The shortcut is created successfully, you can execute [vasma] to reopen the script"
+        fi
+        if [[ -z "${btDomain}" && -d "${nginxConfigPath}" ]] && command -v nginx >/dev/null 2>&1; then
+            ensureNginxBlog >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -7802,11 +8053,7 @@ downloadDLCPlainYAML() {
         return 0
     fi
     local dlcDownloadURL="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat_plain.yml"
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -O "${tmpFilePath}" "${dlcDownloadURL}" >/dev/null 2>&1
-    else
-        wget -c "${wgetShowProgressStatus}" -O "${tmpFilePath}" "${dlcDownloadURL}" >/dev/null 2>&1
-    fi
+    wgetDownload -c -O "${tmpFilePath}" "${dlcDownloadURL}" >/dev/null 2>&1
 
     # shellcheck disable=SC2181
     if [[ "$?" -ne 0 || ! -s "${tmpFilePath}" ]]; then
@@ -10870,6 +11117,7 @@ customSingBoxInstall() {
             initTLSNginxConfig 2 || return 1
             installTLS 3 || return 1
             handleNginx stop || return 1
+            ensureNginxBlog
         fi
 
         removeCoreService xray || return 1
@@ -10880,8 +11128,10 @@ customSingBoxInstall() {
         installCronTLS 7
         handleSingBox stop
         handleSingBox start
-        handleNginx stop || return 1
-        handleNginx start || return 1
+        if echo "${selectCustomInstallType}" | grep -qE ",1,|,3,|,4,|,6,|,11,|,13," || [[ "${realityTargetServer:-}" == "127.0.0.1" ]]; then
+            handleNginx stop || return 1
+            handleNginx start || return 1
+        fi
         # 生成账号
         checkGFWStatue 8
         showAccounts 9
@@ -10991,14 +11241,14 @@ customXrayInstall() {
         fi
         if [[ -n "${btDomain}" ]]; then
             echoContent skyBlue "\nProgress 6/${totalProgress}: Pagoda panel detected, skipping disguised website"
-        elif ! xraySelectionNeedsNginx "${selectCustomInstallType}"; then
-            echoContent skyBlue "\nProgress 6/${totalProgress}: Selected protocols do not require Nginx, skipping disguised website"
-        else
+        elif xraySelectionNeedsNginx "${selectCustomInstallType}"; then
             nginxBlog 6
-        fi
-        if xraySelectionNeedsNginx "${selectCustomInstallType}"; then
             updateRedirectNginxConf
             handleNginx start || return 1
+        elif echo "${selectCustomInstallType}" | grep -q ",6,"; then
+            ensureNginxBlog 6
+        else
+            echoContent skyBlue "\nProgress 6/${totalProgress}: Selected protocols do not require Nginx fronting; camouflage site will auto-deploy if local domain Reality fallback is used"
         fi
 
         # Install Xray
@@ -11134,6 +11384,9 @@ singBoxInstall() {
     removeCoreService xray || return 1
     installSingBox 5 || return 1
     installSingBoxService 6 || return 1
+    if [[ -z "${btDomain}" ]]; then
+        ensureNginxBlog
+    fi
     initSingBoxConfig all 7 || return 1
 
     cleanUp xrayDel || return 1
@@ -11239,7 +11492,8 @@ installSubscribe() {
         mapfile -t result < <(initSingBoxPort "${subscribePort}")
         echo
         echoContent yellow " ---> Configure the subscription cover website \n"
-        nginxBlog
+        ensureNginxBlog
+        ensureNginxServerNamesHashBucketSize
         echo
         local httpSubscribeStatus=
 
@@ -11283,6 +11537,7 @@ server {
     ${nginxSubscribeListen}
     ${serverName}
     ${nginxSubscribeSSL}
+    server_tokens off;
     ssl_protocols              TLSv1.2 TLSv1.3;
     ssl_ciphers                TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers  on;
@@ -11291,51 +11546,71 @@ server {
     resolver_timeout           2s;
     client_max_body_size 100m;
     root ${nginxStaticPath};
+    index index.html;
     location ~ (\.zip\$|/__MACOSX) {
         return 404;
     }
-    location ~ ^/s/(clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles|surge)/(.*) {
+    location ~ ^/s/(clashMeta|default|clashMetaProfiles|clashMetaFull|sing-box|sing-box_profiles|surge)/([A-Za-z0-9._-]+)\$ {
+        limit_except GET HEAD {
+            deny all;
+        }
         default_type 'text/plain; charset=utf-8';
         alias /etc/v2ray-agent/subscribe/\$1/\$2;
     }
     location / {
+        try_files \$uri \$uri/ =404;
     }
 }
 EOF
+        if ! nginx -t >/dev/null 2>&1; then
+            echoContent red " ---> Nginx subscribe.conf validation failed"
+            nginx -t || true
+            rm -f "${nginxConfigPath}subscribe.conf"
+            return 1
+        fi
         bootStartup nginx
         handleNginx stop
         handleNginx start
     else
-        addSubscribeSurgeLocation "${nginxConfigPath}subscribe.conf" || return 1
+        addSubscribeLocations "${nginxConfigPath}subscribe.conf" || return 1
     fi
     if ! isNginxRunning; then
         handleNginx start
     fi
 }
 
-# subscribe.conf written by older versions has no surge in the subscription location, so /s/surge/ returns 404
-# Change only the location regex and keep other manual settings in the file. If nginx -t fails, restore the original file
-addSubscribeSurgeLocation() {
+# Add missing surge/clashMetaFull paths to legacy subscribe.conf while preserving manual directives
+addSubscribeLocations() {
     local subscribeConfig=$1
     [[ -f "${subscribeConfig}" ]] || return 0
-    grep -q 'sing-box_profiles)/' "${subscribeConfig}" || return 0
+    grep -q 'sing-box_profiles' "${subscribeConfig}" || return 0
+    local formats=() format
+    grep -q '|surge)/' "${subscribeConfig}" || formats+=(surge)
+    grep -q '|clashMetaFull|' "${subscribeConfig}" || formats+=(clashMetaFull)
+    [[ "${#formats[@]}" != "0" ]] || return 0
     local backup
     backup=$(mktemp "${subscribeConfig}.XXXXXX") || return 1
     cp -p "${subscribeConfig}" "${backup}" || {
         rm -f "${backup}"
         return 1
     }
-    sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}" || {
-        mv -f "${backup}" "${subscribeConfig}"
-        return 1
-    }
+    for format in "${formats[@]}"; do
+        if [[ "${format}" == surge ]]; then
+            sed -i 's#|sing-box_profiles)/#|sing-box_profiles|surge)/#' "${subscribeConfig}"
+        else
+            sed -i 's#|clashMetaProfiles|#|clashMetaProfiles|clashMetaFull|#' "${subscribeConfig}"
+        fi || {
+            mv -f "${backup}" "${subscribeConfig}"
+            return 1
+        }
+    done
     if ! nginx -t >/dev/null 2>&1; then
         mv -f "${backup}" "${subscribeConfig}"
-        echoContent red " ---> nginx check failed after adding surge to subscribe.conf. The original file stays"
+        echoContent red " ---> nginx check failed after adding ${formats[*]} to subscribe.conf. The original file stays"
         return 1
     fi
     rm -f "${backup}"
-    echoContent green " ---> Added surge to the subscription location"
+    echoContent green " ---> Added ${formats[*]} to subscription locations"
     if isNginxRunning; then
         nginx -s reload >/dev/null 2>&1 || return 1
     fi
@@ -11398,393 +11673,249 @@ addOtherSubscribe() {
         subscribe
     fi
 }
-# clashMeta configuration file
-clashMetaConfig() {
-    local url=$1
-    local id=$2
-    local publishPath=${3:-/etc/v2ray-agent/subscribe}
-    cat <<EOF >"${publishPath}/clashMetaProfiles/${id}"
-log-level: debug
+# Shared Mihomo config base (mode=profiles desktop provider / mode=full standalone with TUN)
+writeMihomoConfigBase() {
+    local target=$1 mode=$2 providerUrl=${3:-}
+    local providerKey="vasma_provider"
+    local headerComment tunBlock findProcessMode sourceField
+    if [[ -n "${subscribeSalt:-}" ]]; then
+        providerKey="${subscribeSalt}_provider"
+    fi
+    if [[ "${mode}" == "profiles" ]]; then
+        headerComment="# vasma Mihomo desktop profile (Proxy-Provider, requires mihomo >= 1.19)"
+        tunBlock=""
+        findProcessMode="strict"
+        sourceField="use: [${providerKey}]"
+    else
+        headerComment="# vasma Mihomo full routing profile (requires mihomo >= 1.19, TUN enabled for Android/CLI)"
+        tunBlock="
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+"
+        findProcessMode='"off"'
+        sourceField="include-all-proxies: true"
+    fi
+
+    cat <<EOF >"${target}" || return 1
+${headerComment}
 mode: rule
-ipv6: true
 mixed-port: 7890
-allow-lan: true
-bind-address: "*"
-lan-allowed-ips:
-  - 0.0.0.0/0
-  - ::/0
-find-process-mode: strict
-external-controller: 0.0.0.0:9090
-
-geox-url:
-  geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
-  geosite: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
-  mmdb: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"
-geo-auto-update: true
-geo-update-interval: 24
-
-external-controller-cors:
-  allow-private-network: true
-
+allow-lan: false
+ipv6: false
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: ${findProcessMode}
+keep-alive-idle: 600
+keep-alive-interval: 30
+external-controller: 127.0.0.1:9090
+geodata-mode: false
+geo-auto-update: false
 profile:
   store-selected: true
   store-fake-ip: true
-
+${tunBlock}
 sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
   override-destination: false
   sniff:
-    QUIC:
-      ports: [ 443 ]
-    TLS:
-      ports: [ 443 ]
     HTTP:
-      ports: [80]
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
 
-
+hosts:
+  dns.alidns.com: [223.5.5.5, 223.6.6.6]
+  doh.pub: [1.12.12.12, 120.53.53.53]
 dns:
   enable: true
-  prefer-h3: false
-  listen: 0.0.0.0:1053
-  ipv6: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  cache-algorithm: arc
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
   fake-ip-filter:
-    - '*.lan'
-    - '*.local'
-    - 'dns.google'
+    - rule-set:private_domain
+    - rule-set:cn_domain
+    - "+.lan"
+    - "+.local"
+    - "+.home.arpa"
+    - "time.*.com"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+    - "time.android.com"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "connect.rom.miui.com"
     - "localhost.ptlogin2.qq.com"
-  use-hosts: true
-  nameserver:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
-    - 1.1.1.1
-    - 8.8.8.8
+    - "localhost.sec.qq.com"
+    - "+.cmpassport.com"
+    - "id6.me"
+    - "open.e.189.cn"
+    - "+.wosms.cn"
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    - "lancache.steamcontent.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   proxy-server-nameserver:
-    - https://223.5.5.5/dns-query
-    - https://1.12.12.12/dns-query
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
   nameserver-policy:
-    "geosite:cn,private":
-      - https://doh.pub/dns-query
+    "rule-set:private_domain,cn_domain,microsoft_cn_domain,apple_cn_domain,steam_cn_domain":
       - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+  nameserver:
+    - "https://1.1.1.1/dns-query#节点选择"
+    - "https://8.8.8.8/dns-query#节点选择"
+
+anchors:
+  svc: &svc {type: select, proxies: [节点选择, 自动选择, 故障转移, DIRECT], ${sourceField}}
+  domain: &domain {type: http, behavior: domain, format: mrs, interval: 86400, proxy: DIRECT}
+  ip: &ip {type: http, behavior: ipcidr, format: mrs, interval: 86400, proxy: DIRECT}
+EOF
+
+    if [[ "${mode}" == "profiles" ]]; then
+        cat <<EOF >>"${target}" || return 1
 
 proxy-providers:
-  ${subscribeSalt}_provider:
+  ${providerKey}:
     type: http
-    path: ./${subscribeSalt}_provider.yaml
-    url: ${url}
+    path: ./${providerKey}.yaml
+    url: "${providerUrl}"
     interval: 3600
     proxy: DIRECT
     health-check:
       enable: true
-      url: https://cp.cloudflare.com/generate_204
+      url: https://www.gstatic.com/generate_204
       interval: 300
+      lazy: true
+EOF
+    fi
+
+    cat <<EOF >>"${target}" || return 1
 
 proxy-groups:
-  - name: 手动切换
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies: null
-  - name: 自动选择
-    type: url-test
-    url: https://cp.cloudflare.com/generate_204
-    interval: 36000
-    tolerance: 50
-    use:
-      - ${subscribeSalt}_provider
-    proxies: null
+  - {name: 节点选择, type: select, proxies: [自动选择, 故障转移, DIRECT], ${sourceField}}
+  - {name: 自动选择, type: url-test, ${sourceField}, url: "https://www.gstatic.com/generate_204", interval: 600, tolerance: 50, lazy: true}
+  - {name: 故障转移, type: fallback, ${sourceField}, url: "https://www.gstatic.com/generate_204", interval: 600, lazy: true}
+  - {name: AI, <<: *svc}
+  - {name: YouTube, <<: *svc}
+  - {name: Google, <<: *svc}
+  - {name: Telegram, <<: *svc}
+  - {name: GitHub, <<: *svc}
+  - {name: Microsoft, type: select, proxies: [DIRECT, 节点选择, 自动选择], ${sourceField}}
+  - {name: Apple, type: select, proxies: [DIRECT, 节点选择, 自动选择], ${sourceField}}
+  - {name: 流媒体, <<: *svc}
+  - {name: 社交媒体, <<: *svc}
+  - {name: 游戏平台, <<: *svc}
+  - {name: 广告拦截, type: select, proxies: [REJECT, DIRECT]}
+  - {name: 漏网之鱼, type: select, proxies: [节点选择, 自动选择, DIRECT], ${sourceField}}
 
-  - name: 全球代理
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: 流媒体
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: DNS_Proxy
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 自动选择
-      - 手动切换
-      - DIRECT
-
-  - name: Telegram
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-  - name: Google
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: YouTube
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-  - name: Netflix
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: Spotify
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: HBO
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: Bing
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-
-  - name: OpenAI
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: ClaudeAI
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: Disney
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: GitHub
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-
-  - name: 国内媒体
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - DIRECT
-  - name: 本地直连
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - DIRECT
-      - 自动选择
-  - name: 漏网之鱼
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - DIRECT
-      - 手动切换
-      - 自动选择
 rule-providers:
-  lan:
-    type: http
-    behavior: classical
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Lan/Lan.yaml
-    path: ./Rules/lan.yaml
-  reject:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/reject.txt
-    path: ./ruleset/reject.yaml
-    interval: 86400
-  proxy:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt
-    path: ./ruleset/proxy.yaml
-    interval: 86400
-  direct:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt
-    path: ./ruleset/direct.yaml
-    interval: 86400
-  private:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/private.txt
-    path: ./ruleset/private.yaml
-    interval: 86400
-  gfw:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/gfw.txt
-    path: ./ruleset/gfw.yaml
-    interval: 86400
-  greatfire:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/greatfire.txt
-    path: ./ruleset/greatfire.yaml
-    interval: 86400
-  tld-not-cn:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/tld-not-cn.txt
-    path: ./ruleset/tld-not-cn.yaml
-    interval: 86400
-  telegramcidr:
-    type: http
-    behavior: ipcidr
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/telegramcidr.txt
-    path: ./ruleset/telegramcidr.yaml
-    interval: 86400
-  applications:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/applications.txt
-    path: ./ruleset/applications.yaml
-    interval: 86400
-  Disney:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Disney/Disney.yaml
-    path: ./ruleset/disney.yaml
-    interval: 86400
-  Netflix:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Netflix/Netflix.yaml
-    path: ./ruleset/netflix.yaml
-    interval: 86400
-  YouTube:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/YouTube/YouTube.yaml
-    path: ./ruleset/youtube.yaml
-    interval: 86400
-  HBO:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/HBO/HBO.yaml
-    path: ./ruleset/hbo.yaml
-    interval: 86400
-  OpenAI:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI.yaml
-    path: ./ruleset/openai.yaml
-    interval: 86400
-  ClaudeAI:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Claude/Claude.yaml
-    path: ./ruleset/claudeai.yaml
-    interval: 86400
-  Bing:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Bing/Bing.yaml
-    path: ./ruleset/bing.yaml
-    interval: 86400
-  Google:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google.yaml
-    path: ./ruleset/google.yaml
-    interval: 86400
-  GitHub:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/GitHub/GitHub.yaml
-    path: ./ruleset/github.yaml
-    interval: 86400
-  Spotify:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Spotify/Spotify.yaml
-    path: ./ruleset/spotify.yaml
-    interval: 86400
-  ChinaMaxDomain:
-    type: http
-    behavior: domain
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_Domain.yaml
-    path: ./Rules/ChinaMaxDomain.yaml
-  ChinaMaxIPNoIPv6:
-    type: http
-    behavior: ipcidr
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_IP_No_IPv6.yaml
-    path: ./Rules/ChinaMaxIPNoIPv6.yaml
-rules:
-  - RULE-SET,YouTube,YouTube,no-resolve
-  - RULE-SET,Google,Google,no-resolve
-  - RULE-SET,GitHub,GitHub
-  - RULE-SET,telegramcidr,Telegram,no-resolve
-  - RULE-SET,Spotify,Spotify,no-resolve
-  - RULE-SET,Netflix,Netflix
-  - RULE-SET,HBO,HBO
-  - RULE-SET,Bing,Bing
-  - RULE-SET,OpenAI,OpenAI
-  - RULE-SET,ClaudeAI,ClaudeAI
-  - RULE-SET,Disney,Disney
-  - RULE-SET,proxy,全球代理
-  - RULE-SET,gfw,全球代理
-  - RULE-SET,applications,本地直连
-  - RULE-SET,ChinaMaxDomain,本地直连
-  - RULE-SET,ChinaMaxIPNoIPv6,本地直连,no-resolve
-  - RULE-SET,lan,本地直连,no-resolve
-  - GEOIP,CN,本地直连
-  - MATCH,漏网之鱼
-EOF
+  private_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs", path: ./ruleset/private_domain.mrs}
+  ads_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ads-all.mrs", path: ./ruleset/ads_domain.mrs}
+  ai_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ai-!cn.mrs", path: ./ruleset/ai_domain.mrs}
+  youtube_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/youtube.mrs", path: ./ruleset/youtube_domain.mrs}
+  google_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs", path: ./ruleset/google_domain.mrs}
+  telegram_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/telegram.mrs", path: ./ruleset/telegram_domain.mrs}
+  github_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/github.mrs", path: ./ruleset/github_domain.mrs}
+  microsoft_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/microsoft@cn.mrs", path: ./ruleset/microsoft_cn_domain.mrs}
+  microsoft_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/microsoft.mrs", path: ./ruleset/microsoft_domain.mrs}
+  apple_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple-cn.mrs", path: ./ruleset/apple_cn_domain.mrs}
+  apple_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple.mrs", path: ./ruleset/apple_domain.mrs}
+  netflix_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/netflix.mrs", path: ./ruleset/netflix_domain.mrs}
+  disney_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/disney.mrs", path: ./ruleset/disney_domain.mrs}
+  hbo_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/hbo.mrs", path: ./ruleset/hbo_domain.mrs}
+  primevideo_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/primevideo.mrs", path: ./ruleset/primevideo_domain.mrs}
+  spotify_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/spotify.mrs", path: ./ruleset/spotify_domain.mrs}
+  twitter_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/twitter.mrs", path: ./ruleset/twitter_domain.mrs}
+  facebook_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/facebook.mrs", path: ./ruleset/facebook_domain.mrs}
+  instagram_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/instagram.mrs", path: ./ruleset/instagram_domain.mrs}
+  tiktok_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/tiktok.mrs", path: ./ruleset/tiktok_domain.mrs}
+  steam_cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/steam@cn.mrs", path: ./ruleset/steam_cn_domain.mrs}
+  steam_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/steam.mrs", path: ./ruleset/steam_domain.mrs}
+  proxy_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/geolocation-!cn.mrs", path: ./ruleset/proxy_domain.mrs}
+  cn_domain: {<<: *domain, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs", path: ./ruleset/cn_domain.mrs}
+  private_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs", path: ./ruleset/private_ip.mrs}
+  google_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/google.mrs", path: ./ruleset/google_ip.mrs}
+  telegram_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs", path: ./ruleset/telegram_ip.mrs}
+  netflix_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/netflix.mrs", path: ./ruleset/netflix_ip.mrs}
+  twitter_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/twitter.mrs", path: ./ruleset/twitter_ip.mrs}
+  facebook_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/facebook.mrs", path: ./ruleset/facebook_ip.mrs}
+  cn_ip: {<<: *ip, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs", path: ./ruleset/cn_ip.mrs}
 
+rules:
+  - RULE-SET,private_domain,DIRECT
+  - RULE-SET,ads_domain,广告拦截
+  - RULE-SET,ai_domain,AI
+  - RULE-SET,youtube_domain,YouTube
+  - RULE-SET,google_domain,Google
+  - RULE-SET,telegram_domain,Telegram
+  - RULE-SET,github_domain,GitHub
+  - RULE-SET,microsoft_cn_domain,DIRECT
+  - RULE-SET,microsoft_domain,Microsoft
+  - RULE-SET,apple_cn_domain,DIRECT
+  - RULE-SET,apple_domain,Apple
+  - RULE-SET,netflix_domain,流媒体
+  - RULE-SET,disney_domain,流媒体
+  - RULE-SET,hbo_domain,流媒体
+  - RULE-SET,primevideo_domain,流媒体
+  - RULE-SET,spotify_domain,流媒体
+  - RULE-SET,twitter_domain,社交媒体
+  - RULE-SET,facebook_domain,社交媒体
+  - RULE-SET,instagram_domain,社交媒体
+  - RULE-SET,tiktok_domain,社交媒体
+  - RULE-SET,steam_cn_domain,DIRECT
+  - RULE-SET,steam_domain,游戏平台
+  - RULE-SET,proxy_domain,节点选择
+  - RULE-SET,cn_domain,DIRECT
+  - RULE-SET,private_ip,DIRECT,no-resolve
+  - RULE-SET,google_ip,Google,no-resolve
+  - RULE-SET,telegram_ip,Telegram,no-resolve
+  - RULE-SET,netflix_ip,流媒体,no-resolve
+  - RULE-SET,twitter_ip,社交媒体,no-resolve
+  - RULE-SET,facebook_ip,社交媒体,no-resolve
+  - RULE-SET,cn_ip,DIRECT
+  - MATCH,漏网之鱼
+
+EOF
+}
+
+clashMetaConfig() {
+    local url=$1
+    local id=$2
+    local publishPath=${3:-/etc/v2ray-agent/subscribe}
+    writeMihomoConfigBase "${publishPath}/clashMetaProfiles/${id}" profiles "${url}"
+}
+
+clashMetaFullConfig() {
+    local proxyFile=$1
+    local id=$2
+    local publishPath=${3:-/etc/v2ray-agent/subscribe}
+    [[ -s "${proxyFile}" ]] || return 0
+    local target="${publishPath}/clashMetaFull/${id}"
+    writeMihomoConfigBase "${target}" full || return 1
+    cat "${proxyFile}" >>"${target}" || return 1
 }
 # Surge subscription. Emits snell/vless/trojan/vmess/hysteria2/tuic/anytls lines for installed protocols. VLESS needs Surge iOS 6.0.0+ / Mac 6.12.0+; naive is not supported
 surgeConfig() {
@@ -11817,7 +11948,8 @@ surgeConfig() {
 
 [General]
 log-level = notify
-dns-server = 1.1.1.1, 223.5.5.5
+dns-server = 223.5.5.5, 119.29.29.29, system
+encrypted-dns-server = https://dns.alidns.com/dns-query, https://doh.pub/dns-query
 ipv6 = false
 skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local
 
@@ -11827,11 +11959,12 @@ ${proxyLines}
 
 [Proxy Group]
 auto = url-test, ${joined}, url=http://www.gstatic.com/generate_204, interval=300, tolerance=100
-${groupName} = select, auto, DIRECT
+${groupName} = select, auto, ${joined}, DIRECT
 
 [Rule]
+GEOIP,LAN,DIRECT
 GEOIP,CN,DIRECT
-FINAL,${groupName}
+FINAL,${groupName},dns-failed
 EOF
 }
 # Random salt
@@ -11863,24 +11996,26 @@ showUserSubscriptions() {
     local publishDir=$4 subscriptionScheme=$5
     local format file subscriptionURL title description index=0
     local -a availableFormats=()
-    for format in default clashMetaProfiles clashMetaFull sing-box surge; do
+    for format in default clashMeta clashMetaProfiles clashMetaFull sing-box sing-box_profiles surge; do
         file="${publishDir}/${format}/${emailMd5}"
         [[ -s "${file}" ]] && availableFormats+=("${format}")
     done
     echoContent brightPurple "\n◆ User subscriptions / SUBSCRIPTIONS"
     printf 'User \033[93m%s\033[0m  /  Available \033[93m%s\033[0m types\n' "${subscriptionUser}" "${#availableFormats[@]}"
     if [[ ${#availableFormats[@]} -eq 0 ]]; then
-        echoContent yellow "  No subscription files exist for this user. Use 6.Generate/update subscriptions first."
+        echoContent yellow "  No subscription files exist for this user. Use 4.Generate/update subscriptions first."
         return 1
     fi
     for format in "${availableFormats[@]}"; do
         index=$((index + 1))
         case "${format}" in
-        default) title="General subscription"; description="For v2rayN, v2rayNG and compatible clients" ;;
-        clashMetaProfiles) title="Mihomo subscription"; description="For Clash Verge Rev and compatible clients" ;;
-        clashMetaFull) title="Mihomo full routing subscription"; description="With DNS leak protection and Android tuning" ;;
-        sing-box) title="sing-box subscription"; description="For sing-box clients" ;;
-        surge) title="Surge subscription"; description="For Surge clients" ;;
+        default) title="General subscription (Base64)"; description="For v2rayN, v2rayNG, Shadowrocket, NekoBox (all URI protocols)" ;;
+        clashMeta) title="Mihomo Proxy Provider"; description="Proxies-only YAML for custom rulesets / proxy-providers (no Naive/Snell)" ;;
+        clashMetaProfiles) title="Mihomo desktop subscription"; description="For Clash Verge Rev, FlClash (MRS rules + anti-leak DNS; UI controls TUN)" ;;
+        clashMetaFull) title="Mihomo full routing subscription"; description="Inline proxies + TUN enabled, tuned for Android / CLI (no Naive/Snell)" ;;
+        sing-box) title="sing-box full subscription"; description="Full routing JSON for sing-box (includes Snell v6; no XHTTP/Naive)" ;;
+        sing-box_profiles) title="sing-box outbounds profile"; description="Outbounds-only JSON array for custom templates or remote merge" ;;
+        surge) title="Surge subscription"; description="For Surge (no XHTTP/Naive; VLESS needs iOS 6.0+ / Mac 6.12+)" ;;
         esac
         echo
         echoContent gray "────────────────────────────────────────"
@@ -11896,11 +12031,9 @@ showUserSubscriptions() {
             printf '%s\n' "${subscriptionURL}" | qrencode -s 10 -m 1 -t UTF8
             echo
         fi
-        echoContent gold "Online QR code\n"
-        echoContent brightGreen "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscriptionURL}"
     done
     echo
-    echoContent gray "Copy a link or scan its QR code to import. Keep links private."
+    echoContent gray "Copy a link or scan its terminal QR code to import. Keep links private."
 
 }
 
@@ -11971,7 +12104,7 @@ subscribe() (
     rm -rf "${subscribePublishPath}" "${publishBackup}" "${saltBackup}" "${saltTemp}"
     exit "${status}"
     ' EXIT
-    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,sing-box,sing-box_profiles,surge} || return 1
+    mkdir -p "${subscribePublishPath}/"{default,clashMeta,clashMetaProfiles,clashMetaFull,sing-box,sing-box_profiles,surge} || return 1
     local renewSalt=$1
     local showStatus=$2
     if [[ "${coreInstallType}" == "1" || "${coreInstallType}" == "2" ]]; then
@@ -12023,13 +12156,25 @@ subscribe() (
                 local emailMd5=
                 emailMd5=$(echo -n "${email}${subscribeSalt}"$'\n' | md5sum | awk '{print $1}')
 
-                cat "/etc/v2ray-agent/subscribe_local/default/${email}" >>"${subscribePublishPath}/default/${emailMd5}" || return 1
+                if [[ -s "/etc/v2ray-agent/subscribe_local/default/${email}" ]]; then
+                    cat "/etc/v2ray-agent/subscribe_local/default/${email}" >>"${subscribePublishPath}/default/${emailMd5}" || return 1
+                fi
+                if [[ -s "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
+                    cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"${subscribePublishPath}/clashMeta/${emailMd5}" || return 1
+                fi
+                if [[ -s "/etc/v2ray-agent/subscribe_local/surge/${email}" ]]; then
+                    cat "/etc/v2ray-agent/subscribe_local/surge/${email}" >>"${subscribePublishPath}/surge/${emailMd5}" || return 1
+                fi
                 if [[ "${updateOtherSubscribeStatus}" == "y" ]]; then
                     updateRemoteSubscribe "${emailMd5}" "${email}" "${subscribePublishPath}"
                 fi
-                local base64Result
-                base64Result=$(base64 -w 0 "${subscribePublishPath}/default/${emailMd5}") || return 1
-                echo "${base64Result}" >"${subscribePublishPath}/default/${emailMd5}" || return 1
+                if [[ -s "${subscribePublishPath}/default/${emailMd5}" ]]; then
+                    local base64Result
+                    base64Result=$(base64 -w 0 "${subscribePublishPath}/default/${emailMd5}") || return 1
+                    echo "${base64Result}" >"${subscribePublishPath}/default/${emailMd5}" || return 1
+                else
+                    rm -f "${subscribePublishPath}/default/${emailMd5}"
+                fi
                 echoContent yellow "--------------------------------------------------------------"
                 local currentDomain=${currentHost}
 
@@ -12037,41 +12182,66 @@ subscribe() (
                     currentDomain="${currentHost}:${currentDefaultPort}"
                 fi
                 if [[ -n "${subscribePortLocal}" ]]; then
-                    if [[ "${subscribeType}" == "http" ]]; then
+                    if [[ "${subscribeType}" == "http" || -z "${currentDomain}" || "${currentDomain}" == "null" ]]; then
                         currentDomain="$(getPublicIP):${subscribePort}"
                     else
                         currentDomain="${currentHost}:${subscribePort}"
                     fi
                 fi
-                if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
-                    cat "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" >>"${subscribePublishPath}/clashMeta/${emailMd5}" || return 1
-
+                if [[ -s "${subscribePublishPath}/clashMeta/${emailMd5}" ]]; then
                     sed -i '1i\proxies:' "${subscribePublishPath}/clashMeta/${emailMd5}" || return 1
 
                     local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
                     clashMetaConfig "${clashProxyUrl}" "${emailMd5}" "${subscribePublishPath}" || return 1
+                    clashMetaFullConfig "${subscribePublishPath}/clashMeta/${emailMd5}" "${emailMd5}" "${subscribePublishPath}" || return 1
+                else
+                    rm -f "${subscribePublishPath}/clashMeta/${emailMd5}" \
+                        "${subscribePublishPath}/clashMetaProfiles/${emailMd5}" \
+                        "${subscribePublishPath}/clashMetaFull/${emailMd5}"
                 fi
-                if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
+                if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]] &&
+                    jq -e 'type == "array" and length > 0' "/etc/v2ray-agent/subscribe_local/sing-box/${email}" >/dev/null 2>&1; then
                     cp "/etc/v2ray-agent/subscribe_local/sing-box/${email}" "${subscribePublishPath}/sing-box_profiles/${emailMd5}" || return 1
 
+                    local sbTemplateCache="/etc/v2ray-agent/sing-box/sing-box-sub-template.json"
+                    local sbTemplateTmp="${subscribePublishPath}/sing-box/${emailMd5}_download"
+                    local sbTemplateReady=false tmplUrl
                     echoContent skyBlue " ---> Download sing-box generic configuration file "
-                    if [[ "${release}" == "alpine" ]]; then
-                        wget -O "${subscribePublishPath}/sing-box/${emailMd5}_download" -q "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json" || return 1
-                    else
-                        wget -O "${subscribePublishPath}/sing-box/${emailMd5}_download" -q "${wgetShowProgressStatus}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json" || return 1
+                    for tmplUrl in \
+                        "https://raw.githubusercontent.com/szxypi/v2ray-agent/master/documents/sing-box.json" \
+                        "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/documents/sing-box.json"; do
+                        wgetDownload -O "${sbTemplateTmp}" "${tmplUrl}" || true
+                        if [[ -s "${sbTemplateTmp}" ]] && jq empty "${sbTemplateTmp}" >/dev/null 2>&1; then
+                            mkdir -p "${sbTemplateCache%/*}" >/dev/null 2>&1 || true
+                            cp -f "${sbTemplateTmp}" "${sbTemplateCache}" >/dev/null 2>&1 || true
+                            sbTemplateReady=true
+                            break
+                        fi
+                    done
+                    if [[ "${sbTemplateReady}" != true && -s "${sbTemplateCache}" ]] && jq empty "${sbTemplateCache}" >/dev/null 2>&1; then
+                        cp -f "${sbTemplateCache}" "${sbTemplateTmp}" || return 1
+                        sbTemplateReady=true
+                        echoContent yellow " ---> Remote template download failed; using cached local template"
+                    fi
+                    if [[ "${sbTemplateReady}" != true ]]; then
+                        rm -f "${sbTemplateTmp}"
+                        return 1
                     fi
 
                     jq --slurpfile nodes "/etc/v2ray-agent/subscribe_local/sing-box/${email}" '
                       .outbounds |= (map(if has("outbounds") then .outbounds += ($nodes[0] | map(.tag)) else . end) + $nodes[0])' \
-                        "${subscribePublishPath}/sing-box/${emailMd5}_download" >"${subscribePublishPath}/sing-box/${emailMd5}_tmp" &&
+                        "${sbTemplateTmp}" >"${subscribePublishPath}/sing-box/${emailMd5}_tmp" &&
                         mv -f "${subscribePublishPath}/sing-box/${emailMd5}_tmp" "${subscribePublishPath}/sing-box/${emailMd5}" || return 1
-                    rm -f "${subscribePublishPath}/sing-box/${emailMd5}_download"
+                    rm -f "${sbTemplateTmp}"
+                else
+                    rm -f "${subscribePublishPath}/sing-box/${emailMd5}" \
+                        "${subscribePublishPath}/sing-box_profiles/${emailMd5}"
                 fi
-                if [[ -f "/etc/v2ray-agent/subscribe_local/surge/${email}" ]]; then
-                    cp "/etc/v2ray-agent/subscribe_local/surge/${email}" "${subscribePublishPath}/surge/${emailMd5}" || return 1
-
+                if [[ -s "${subscribePublishPath}/surge/${emailMd5}" ]]; then
                     local surgeProxyUrl="${subscribeType}://${currentDomain}/s/surge/${emailMd5}"
                     surgeConfig "${subscribePublishPath}/surge/${emailMd5}" "${emailMd5}" "${surgeProxyUrl}" "${subscribePublishPath}" || return 1
+                else
+                    rm -f "${subscribePublishPath}/surge/${emailMd5}"
                 fi
                 if [[ -z "${showStatus}" ]]; then
                     showUserSubscriptions "${email}" "${emailMd5}" "${currentDomain}" "${subscribePublishPath}" "${subscribeType}" || return 1
@@ -12126,38 +12296,55 @@ updateRemoteSubscribe() {
         fi
         local clashMetaProxies=
 
-        clashMetaProxies=$(curl -s "${subscribeType}://${remoteUrl}/s/clashMeta/${emailMD5}" | sed '/proxies:/d' | sed "s/\"${email}/\"${email}_${serverAlias}/g")
+        clashMetaProxies=$(curl -fsSL --connect-timeout 5 -m 15 "${subscribeType}://${remoteUrl}/s/clashMeta/${emailMD5}" | sed '/^proxies:[[:space:]]*$/d' | sed "s/\"${email}/\"${email}_${serverAlias}/g") || clashMetaProxies=""
 
-        if ! echo "${clashMetaProxies}" | grep -q "nginx" && [[ -n "${clashMetaProxies}" ]]; then
-            echo "${clashMetaProxies}" >>"${publishPath}/clashMeta/${emailMD5}"
+        if echo "${clashMetaProxies}" | grep -qE '^[[:space:]]*-[[:space:]]+name:' && ! echo "${clashMetaProxies}" | grep -qiE '<html|404 Not Found|nginx'; then
+            printf '%s\n' "${clashMetaProxies}" >>"${publishPath}/clashMeta/${emailMD5}"
             echoContent green " ---> clashMeta subscription ${remoteUrl}:${email} updated successfully "
         else
             echoContent red " ---> clashMeta subscription ${remoteUrl}:${email} does not exist "
         fi
 
         local default=
-        default=$(curl -s "${subscribeType}://${remoteUrl}/s/default/${emailMD5}")
+        default=$(curl -fsSL --connect-timeout 5 -m 15 "${subscribeType}://${remoteUrl}/s/default/${emailMD5}") || default=""
 
-        if ! echo "${default}" | grep -q "nginx" && [[ -n "${default}" ]]; then
-            default=$(echo "${default}" | base64 -d | sed "s/#${email}/#${email}_${serverAlias}/g")
-            echo "${default}" >>"${publishPath}/default/${emailMD5}"
-
-            echoContent green " ---> generic subscription ${remoteUrl}:${email} updated successfully "
+        if [[ -n "${default}" ]] && ! echo "${default}" | grep -qiE '<html|404 Not Found|nginx'; then
+            default=$(printf '%s' "${default}" | base64 -d 2>/dev/null | sed "s/#${email}/#${email}_${serverAlias}/g")
+            if echo "${default}" | grep -q '://'; then
+                printf '%s\n' "${default}" >>"${publishPath}/default/${emailMD5}"
+                echoContent green " ---> generic subscription ${remoteUrl}:${email} updated successfully "
+            else
+                echoContent red " ---> generic subscription ${remoteUrl}:${email} parse failed "
+            fi
         else
             echoContent red " ---> generic subscription ${remoteUrl}:${email} does not exist "
         fi
 
         local singBoxSubscribe=
-        singBoxSubscribe=$(curl -s "${subscribeType}://${remoteUrl}/s/sing-box_profiles/${emailMD5}")
+        singBoxSubscribe=$(curl -fsSL --connect-timeout 5 -m 15 "${subscribeType}://${remoteUrl}/s/sing-box_profiles/${emailMD5}") || singBoxSubscribe=""
 
-        if ! echo "${singBoxSubscribe}" | grep -q "nginx" && [[ -n "${singBoxSubscribe}" ]]; then
-            singBoxSubscribe=${singBoxSubscribe//tag\": \"${email}/tag\": \"${email}_${serverAlias}}
-            singBoxSubscribe=$(jq ". +=${singBoxSubscribe}" "/etc/v2ray-agent/subscribe_local/sing-box/${email}")
-            echo "${singBoxSubscribe}" | jq . >"/etc/v2ray-agent/subscribe_local/sing-box/${email}"
+        if [[ -n "${singBoxSubscribe}" ]] && jq -e 'type == "array"' <<<"${singBoxSubscribe}" >/dev/null 2>&1; then
+            singBoxSubscribe=$(jq -c --arg from "${email}" --arg to "${email}_${serverAlias}" \
+                'map(if (.tag | type) == "string" and (.tag | startswith($from)) then .tag = ($to + (.tag[($from|length):])) else . end)' \
+                <<<"${singBoxSubscribe}")
+            local mergedSingBox
+            mergedSingBox=$(jq --argjson remote "${singBoxSubscribe}" '. += $remote' "/etc/v2ray-agent/subscribe_local/sing-box/${email}") &&
+                echo "${mergedSingBox}" | jq . >"/etc/v2ray-agent/subscribe_local/sing-box/${email}"
 
-            echoContent green " ---> generic subscription ${remoteUrl}:${email} updated successfully "
+            echoContent green " ---> sing-box subscription ${remoteUrl}:${email} updated successfully "
         else
-            echoContent red " ---> generic subscription ${remoteUrl}:${email} does not exist "
+            echoContent red " ---> sing-box subscription ${remoteUrl}:${email} does not exist "
+        fi
+
+        local surgeSubscribe=
+        surgeSubscribe=$(curl -fsSL --connect-timeout 5 -m 15 "${subscribeType}://${remoteUrl}/s/surge/${emailMD5}") || surgeSubscribe=""
+        if [[ -n "${surgeSubscribe}" ]] && ! echo "${surgeSubscribe}" | grep -qiE '<html|404 Not Found|nginx'; then
+            local surgeProxyLines=
+            surgeProxyLines=$(awk '/^\[Proxy\]/{f=1;next} /^\[/{f=0} f && / = / && !/^DIRECT[[:space:]]*=/{print}' <<<"${surgeSubscribe}" | sed -E "s/^(${email}[^= ]*) = /\1_${serverAlias} = /")
+            if [[ -n "${surgeProxyLines}" ]]; then
+                printf '%s\n' "${surgeProxyLines}" >>"${publishPath}/surge/${emailMD5}"
+                echoContent green " ---> Surge subscription ${remoteUrl}:${email} updated successfully "
+            fi
         fi
 
     done < <(grep -v '^$' <"/etc/v2ray-agent/subscribe_remote/remoteSubscribeUrl")
@@ -12245,11 +12432,38 @@ initRealityKey() {
         fi
     fi
 }
+# Initialize Reality shortId
+initRealityShortId() {
+    local existingShortId="${1:-}"
+    local sidFile="/etc/v2ray-agent/reality_shortid"
+    if [[ -z "${existingShortId}" && -s "${sidFile}" ]]; then
+        existingShortId=$(tr -d '\r\n' <"${sidFile}")
+    fi
+    realityShortId=
+    if [[ -n "${existingShortId}" && "${existingShortId}" =~ ^[0-9a-fA-F]{2,16}$ ]]; then
+        if [[ -n "${lastInstallationConfig}" ]]; then
+            realityShortId="${existingShortId}"
+        else
+            read -r -p "Previous shortId detected (${existingShortId}), reuse it? [y/n]:" historyShortIdStatus
+            if [[ "${historyShortIdStatus}" == "y" ]]; then
+                realityShortId="${existingShortId}"
+            fi
+        fi
+    fi
+    if [[ -z "${realityShortId}" ]]; then
+        realityShortId=$(generateRealityShortId)
+    fi
+    mkdir -p /etc/v2ray-agent >/dev/null 2>&1 || true
+    printf '%s\n' "${realityShortId}" >"${sidFile}"
+    echoContent green " ---> Reality shortId: ${realityShortId}"
+}
+
 # 初始化 mldsa65Seed
 initRealityMldsa65() {
     echoContent skyBlue "\n Generate Reality mldsa65\n"
-    if /etc/v2ray-agent/xray/xray tls ping "${realityServerName}:${realityDomainPort}" 2>/dev/null | grep -q "X25519MLKEM768"; then
-        length=$(/etc/v2ray-agent/xray/xray tls ping "${realityServerName}:${realityDomainPort}" | grep "Certificate chain's total length:" | awk '{print $5}' | head -1)
+    local pingTarget="${realityTargetServer:-${realityServerName}}:${realityDomainPort}"
+    if /etc/v2ray-agent/xray/xray tls ping "${pingTarget}" 2>/dev/null | grep -q "X25519MLKEM768"; then
+        length=$(/etc/v2ray-agent/xray/xray tls ping "${pingTarget}" | grep "Certificate chain's total length:" | awk '{print $5}' | head -1)
 
         if [ "$length" -gt 3500 ]; then
             if [[ -n "${currentRealityMldsa65Seed}" && -z "${lastInstallationConfig}" ]]; then
@@ -12308,51 +12522,34 @@ initRealityClientServersName() {
         realityDestDomainList="download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,www.lovelive-anime.jp,academy.nvidia.com,dl.google.com,www.google-analytics.com,www.python.org,vuejs-jp.org,vuejs.org,zh-hk.vuejs.org,react.dev,www.oracle.com,www.mysql.com,www.mongodb.com,cname.vercel-dns.com,vercel-dns.com,www.swift.com,academy.nvidia.com,www.swift.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,www.fom-international.com,github.io"
     fi
     if [[ -n "${realityServerName}" && -z "${lastInstallationConfig}" ]]; then
-        if echo ${realityDestDomainList} | grep -q "${realityServerName}"; then
-            read -r -p " Previous installation setting detected: Reality Domain , Use ?[y/n]:" realityServerNameStatus
-            if [[ "${realityServerNameStatus}" != "y" ]]; then
-                realityServerName=
-                realityDomainPort=
-            fi
-        else
+        read -r -p " Previous installation setting detected: Reality Domain (${realityServerName}), reuse? [y/n]:" realityServerNameStatus
+        if [[ "${realityServerNameStatus}" != "y" ]]; then
             realityServerName=
             realityDomainPort=
+            realityTargetServer=
         fi
-    elif [[ -n "${realityServerName}" && -z "${lastInstallationConfig}" ]]; then
+    elif [[ -n "${realityServerName}" && -n "${lastInstallationConfig}" ]]; then
+        :
+    else
         realityServerName=
         realityDomainPort=
+        realityTargetServer=
     fi
 
+    local localDecoyDomain="${domain:-${currentHost}}"
     if [[ -z "${realityServerName}" ]]; then
-        if [[ -n "${domain}" ]]; then
+        if [[ -n "${localDecoyDomain}" && -s "/etc/v2ray-agent/tls/${localDecoyDomain}.crt" && -s "/etc/v2ray-agent/tls/${localDecoyDomain}.key" ]]; then
             echo
-            read -r -p " Use ${domain} as the Reality target domain ?[y/n]:" realityServerNameCurrentDomainStatus
+            read -r -p " Use this server's decoy domain ${localDecoyDomain} (127.0.0.1:31443) as the Reality fallback site? [y/n]:" realityServerNameCurrentDomainStatus
             if [[ "${realityServerNameCurrentDomainStatus}" == "y" ]]; then
-                realityServerName="${domain}"
-                if [[ "${selectCoreType}" == "1" ]]; then
-                    if [[ -z "${subscribePort}" ]]; then
-                        echo
-                        installSubscribe
-                        readNginxSubscribe
-                        realityDomainPort="${subscribePort}"
-                    else
-                        realityDomainPort="${subscribePort}"
-                    fi
-                fi
-                if [[ "${selectCoreType}" == "2" ]]; then
-                    if [[ -z "${subscribePort}" ]]; then
-                        echo
-                        installSubscribe
-                        readNginxSubscribe
-                        realityDomainPort="${subscribePort}"
-                    else
-                        realityDomainPort="${subscribePort}"
-                    fi
-                fi
+                realityServerName="${localDecoyDomain}"
+                realityTargetServer="127.0.0.1"
+                realityDomainPort=31443
             fi
         fi
         if [[ -z "${realityServerName}" ]]; then
             realityDomainPort=443
+            realityTargetServer=
             echoContent skyBlue "\n================ Configure serverNames available to the client ================\n"
             echoContent yellow "#Notes"
             echoContent green "List of serverNames available to the client: https://www.v2ray-agent.com/archives/1680104902581#heading-8\n"
@@ -12371,9 +12568,25 @@ initRealityClientServersName() {
         fi
     fi
 
-    realityDestDomain="${realityServerName}:${realityDomainPort}"
-    echoContent yellow "\n ---> Client server name : ${realityServerName}:${realityDomainPort}\n"
-    if [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]]; then
+    if [[ -n "${localDecoyDomain}" && "${realityServerName}" == "${localDecoyDomain}" ]] &&
+        [[ -s "/etc/v2ray-agent/tls/${localDecoyDomain}.crt" && -s "/etc/v2ray-agent/tls/${localDecoyDomain}.key" ]] &&
+        [[ "${realityTargetServer:-}" == "127.0.0.1" || "${realityDomainPort}" == "31443" ]]; then
+        realityTargetServer="127.0.0.1"
+        realityDomainPort=31443
+        if [[ -z "${btDomain}" ]]; then
+            if ! command -v nginx >/dev/null 2>&1; then
+                installNginxTools || return 1
+            fi
+            ensureNginxBlog
+            singBoxDecoyNginxConfig
+            bootStartup nginx
+            handleNginx start
+        fi
+    fi
+
+    realityDestDomain="${realityTargetServer:-${realityServerName}}:${realityDomainPort}"
+    echoContent yellow "\n ---> Client server name (SNI): ${realityServerName}, fallback target: ${realityDestDomain}\n"
+    if [[ "${realityTargetServer:-}" != "127.0.0.1" ]] && [[ "${coreInstallType}" == "2" || "${selectCoreType}" == "2" ]]; then
         checkRealityDest
     fi
 }
